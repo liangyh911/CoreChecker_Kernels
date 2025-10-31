@@ -586,8 +586,15 @@ public:
     printf("m: %d, n: %d, k: %d, log: %d\n", params_.problem_size.m(), params_.problem_size.n(), params_.problem_size.k(), params_.swizzle_log_tile);
     std::cout << std::is_same<LayoutA_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutB_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutC_, cutlass::layout::RowMajor>::value <<std::endl;
 
-    cudaMalloc((void**)&SM_check_res, 132 * sizeof(int));
-    cudaMemset(SM_check_res, 0, 132 * sizeof(int));
+    // unsigned int nsmid;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int num_sms = prop.multiProcessorCount;
+
+    // printf("SM count: %d\n", num_sms);
+
+    cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
+    cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
 
     bool deBug = true;
     int iterations = 500;
@@ -596,7 +603,8 @@ public:
     cudaEventCreate(&stop);
     float t_compute = 0;
     // dim3 new_block(64,1,1);
-    dim3 new_grid(12,11,1);
+    // dim3 new_grid(12,11,1);
+    dim3 new_grid(num_sms, 1, 1);
 
     void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion
                 // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking

@@ -425,10 +425,15 @@ public:
     ThreadblockSwizzle threadblock_swizzle;
 
     // dim3 grid = threadblock_swizzle.get_grid_shape(params_.grid_tiled_shape);
-    dim3 block(GemmKernel::kThreadCount, 1, 1);
-    dim3 new_grid(132,1,1);
 
-    dim3 grid_updatechk(132,1,1);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int num_sms = prop.multiProcessorCount;
+
+    dim3 block(GemmKernel::kThreadCount, 1, 1);
+    dim3 new_grid(num_sms,1,1);
+
+    dim3 grid_updatechk(num_sms,1,1);
     dim3 block_updatechk(1024,1, 1);
 
     // dim3 grid_updatechk_v5(264,1,1);
@@ -446,8 +451,8 @@ public:
     cudaEventCreate(&stop);
     float t_gemm = 0, t_chksum = 0, t_check = 0;
 
-    cudaMalloc((void**)&SM_check_res, 132 * sizeof(int));
-    cudaMemset(SM_check_res, 0, 132 * sizeof(int));
+    cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
+    cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
 
     // cudaMalloc((void**)&SM_local_blkIdx, 132 * sizeof(int));
     // cudaMemset(SM_local_blkIdx, 0, 132 * sizeof(int));
@@ -478,7 +483,17 @@ public:
     int update_smem_size = batch_per_TB * 2 * params_.problem_size.k() * sizeof(ElementA);
 
     // 128 96 112
-    int matrix_SM = (if_split_phase == 2)? 132 : 128;
+    // int matrix_SM = (if_split_phase == 2)? 132 : 128;
+    int matrix_SM = num_sms;
+    if(if_split_phase != 2){
+      int sm_per_batch = params_.grid_tiled_shape.m() * params_.grid_tiled_shape.n();
+      if(num_sms % sm_per_batch == 0){
+        matrix_SM = num_sms - sm_per_batch;
+      }
+      else{
+        matrix_SM = num_sms - (num_sms % sm_per_batch);
+      }
+    }
     
     void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion, &matrix_SM, &monitored_batched_count};
 
@@ -491,13 +506,13 @@ public:
       if(transpose == 0){
         // printf("non-transpose\n");
         cudaFuncSetAttribute(cutlass::update_checksum_v3<GemmKernel, ElementA>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);
-        cutlass::update_checksum_v3<GemmKernel, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, batch_per_TB);
+        cutlass::update_checksum_v3<GemmKernel, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, batch_per_TB, num_sms);
       }
       else{
         // printf("transpose\n");
         update_smem_size = (2 * params_.problem_size.k() + 34 * params_.problem_size.n()) * sizeof(ElementA);
         cudaFuncSetAttribute(cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);
-        cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, monitored_batched_count);
+        cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, monitored_batched_count,num_sms);
       }
 
       // cudaFuncSetAttribute(cutlass::update_checksum_v3_T<GemmKernel, ElementC>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);
@@ -550,12 +565,12 @@ public:
 
         if(transpose == 0){
           cudaFuncSetAttribute(cutlass::update_checksum_v3<GemmKernel, ElementA>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);
-          cutlass::update_checksum_v3<GemmKernel, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, batch_per_TB);
+          cutlass::update_checksum_v3<GemmKernel, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, batch_per_TB, num_sms);
         }
         else{
           update_smem_size = (2 * params_.problem_size.k() + 34 * params_.problem_size.n()) * sizeof(ElementA);
           cudaFuncSetAttribute(cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);
-          cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, monitored_batched_count);
+          cutlass::update_checksum_v8_T<GemmKernel, 16, 2, ElementA><<<grid_updatechk, block_updatechk, update_smem_size, stream_colchk>>>(params_, matrix_SM, monitored_batched_count, num_sms);
         }
 
         // cudaFuncSetAttribute(cutlass::update_checksum_v3_T<GemmKernel, ElementC>, cudaFuncAttributeMaxDynamicSharedMemorySize, update_smem_size);

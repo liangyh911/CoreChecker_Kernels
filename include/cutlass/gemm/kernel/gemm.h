@@ -438,9 +438,15 @@ struct Gemm {
                 ) {
 
     // get SM id
-    unsigned int smid;
+    unsigned int smid, nsmid;
     asm volatile("mov.u32 %0, %smid;" : "=r"(smid));
+    asm volatile("mov.u32 %0, %nsmid;" : "=r"(nsmid));
+    
     int threadblock_tile_offset_m, threadblock_tile_offset_k, threadblock_tile_offset_n;
+      
+    // if(threadIdx.x == 0){
+    //   printf("smid: %d, nsmid: %d", smid, nsmid);
+    // }
 
     // SM based schedule info
     int checksumblk_per_col = 0;
@@ -453,13 +459,13 @@ struct Gemm {
     int matrix_shape_m = params.grid_tiled_shape.m() - checksumblk_per_col;
     int matrix_shape_n = params.grid_tiled_shape.n();
 
-    int max_col = (int)ceil((double)132 / (double)(matrix_shape_m));
+    int max_col = (int)ceil((double)nsmid / (double)(matrix_shape_m));
     if(max_col > params.grid_tiled_shape.n()){
       max_col = params.grid_tiled_shape.n();
     }
 
     int remaining_SM = (int)(max_col * checksumblk_per_col);
-    int matrix_SM = (int)(132 - remaining_SM);
+    int matrix_SM = (int)(nsmid - remaining_SM);
 
     int matrix_next_blk_offset_m = matrix_SM % matrix_shape_m;
     int matrix_next_blk_offset_n = matrix_SM / matrix_shape_m;

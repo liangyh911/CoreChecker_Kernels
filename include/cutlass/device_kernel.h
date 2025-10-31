@@ -335,7 +335,7 @@ void update_checksum_v2(typename Operator::Params params, int matrix_SM, int bat
 
 template <typename Operator, typename Dtype>
 CUTLASS_GLOBAL
-void update_checksum_v3(typename Operator::Params params, int matrix_SM, int TB_per_batch){
+void update_checksum_v3(typename Operator::Params params, int matrix_SM, int TB_per_batch, int num_sms){
   // get SM id
   unsigned int real_smid;
   asm volatile("mov.u32 %0, %smid;" : "=r"(real_smid));
@@ -348,7 +348,7 @@ void update_checksum_v3(typename Operator::Params params, int matrix_SM, int TB_
 
   // return gemm SM (96)
   // int matrix_SM = 128;
-  int chk_SM = 132 - matrix_SM;
+  int chk_SM = num_sms - matrix_SM;
   int tid = threadIdx.x;
 
   extern __shared__ Dtype SharedMem[];
@@ -1129,7 +1129,7 @@ void update_checksum_v7_T(typename Operator::Params params, int matrix_SM){
 
 template <typename Operator, int tiled_K, int num_stages, typename Dtype>
 CUTLASS_GLOBAL
-void update_checksum_v8_T(typename Operator::Params params, int matrix_SM, int monitored_batched_count){
+void update_checksum_v8_T(typename Operator::Params params, int matrix_SM, int monitored_batched_count, int num_sms){
   // get SM id
   unsigned int real_smid;
   asm volatile("mov.u32 %0, %smid;" : "=r"(real_smid));
@@ -1170,7 +1170,7 @@ void update_checksum_v8_T(typename Operator::Params params, int matrix_SM, int m
   // int m1k =(M + 1) * K;
   int m1n = (M + 1) * N;
   
-  int chk_step = 132 - matrix_SM;
+  int chk_step = num_sms - matrix_SM;
   int local_smid = real_smid - matrix_SM;
   // int chk_step = chk_SM * TB_per_batch;
 
