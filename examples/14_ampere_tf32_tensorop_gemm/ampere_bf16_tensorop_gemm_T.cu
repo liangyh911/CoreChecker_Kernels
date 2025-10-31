@@ -44,9 +44,9 @@ data types in tensor cores.  One big advantage is that we can load in fp32 data 
 implicitly to tf32 inside the GEMM kernel which means no change is needed to accelerate traditional
 fp32 data by using NVIDIA Ampere architecture.
 
-nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/yuhangl/cutlass/examples/common -arch=sm_90 -o outT_c_bf16.exe
+nvcc ampere_bf16_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -o outT_c_bf16.exe
 
-nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90 -o outT_baseline_bf16.exe
+nvcc ampere_bf16_tensorop_gemm_T.cu -O0 -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90 -o outT_baseline_bf16.exe
 
 ncu -f -o transpose --set full ./outT_c_bf16.exe --m=4096 --n=8192 --k=4096 --split=0 --iterations=1
 
@@ -557,7 +557,7 @@ int run(Options &options) {
 
   for (int iter = 0; iter < options.iterations; ++iter) {
     // Launch initialized CUTLASS kernel
-    status = gemm_op(options.if_split_phase, options.partition, 1);
+    status = gemm_op(options.if_split_phase, options.partition);
     // status = gemm_op(options.if_split_phase, options.partition, 
     //                   all_start, compute, finding, recompute, compare, checking);
     // status = gemm_op();
