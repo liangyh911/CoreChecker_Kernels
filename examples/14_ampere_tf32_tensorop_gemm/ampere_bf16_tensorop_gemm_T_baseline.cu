@@ -213,6 +213,10 @@ using ElementInputA = cutlass::bfloat16_t;                        // <- data typ
 using ElementInputB = cutlass::bfloat16_t;                        // <- data type of elements in input matrix B
 using ElementOutput = cutlass::bfloat16_t;                        // <- data type of elements in output matrix D
 
+// using ElementInputA = float;                        // <- data type of elements in input matrix A
+// using ElementInputB = float;                        // <- data type of elements in input matrix B
+// using ElementOutput = float;                        // <- data type of elements in output matrix D
+
 // The code section below describes matrix layout of input and output matrices. Column Major for
 // Matrix A, Row Major for Matrix B and Row Major for Matrix C
 using LayoutInputA = cutlass::layout::RowMajor;
@@ -758,7 +762,7 @@ int main(int argc, const char **argv) {
     return 0;
   }
 
-  printf("%d x %d x %d TF32 tensor op Matrix Multiply\n", \
+  printf("%d x %d x %d BF16 tensor op Transposed Matrix Multiply\n", \
     options.problem_size.m(), options.problem_size.n(), options.problem_size.k());
 
   if (!options.valid()) {

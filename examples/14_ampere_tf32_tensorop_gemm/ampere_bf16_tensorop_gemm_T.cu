@@ -758,7 +758,7 @@ int main(int argc, const char **argv) {
     return 0;
   }
 
-  printf("%d x %d x %d TF32 tensor op Matrix Multiply\n", \
+  printf("%d x %d x %d BF16 tensor op Transposed Matrix Multiply\n", \
     options.problem_size.m(), options.problem_size.n(), options.problem_size.k());
 
   if (!options.valid()) {
