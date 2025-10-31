@@ -98,8 +98,8 @@ pip install --upgrade git+https://github.com/huggingface/transformers.git
 
 import torch
 import torch.nn as nn
-linear_layer = nn.Linear(in_features=4096, out_features=4096, bias=False).to('cuda')
-input_tensor = torch.randn(8192, 4096).to('cuda')
+linear_layer = nn.Linear(in_features=4096, out_features=4096, bias=False).to(torch.bfloat16).to('cuda')
+input_tensor = torch.randn(8192, 4096).to(torch.bfloat16).to('cuda')
 output_tensor = linear_layer(input_tensor)
 
 linear_layer_cpu = linear_layer.to('cpu')
