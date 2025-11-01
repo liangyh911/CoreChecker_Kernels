@@ -33,7 +33,7 @@ test_Transposed_GEMM_BF16(){
 
     echo "***MLP: UP_Projection/Gate_Projection (m = 8192, n = 14336, k = 4096)"
     echo "--SM-Checker:"
-    ./outT_c_bf16.exe --m=14336 --n=8192 --k=4096 --split=0 --iterations=5
+    ./outT_c_f32.exe --m=14336 --n=8192 --k=4096 --split=0 --iterations=5
     echo "--Baseline:"
     ./outT_baseline_f32.exe  --m=14336 --n=8192 --k=4096 --split=2 --iterations=5
 
