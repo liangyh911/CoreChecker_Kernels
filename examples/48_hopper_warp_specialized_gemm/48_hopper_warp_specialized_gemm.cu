@@ -52,6 +52,8 @@
 
     nvcc 48_hopper_warp_specialized_gemm.cu -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90a -D__CUDA_ARCH_FEAT_SM90_ALL --expt-relaxed-constexpr -std=c++17 -o cutlass_test.exe 
 
+    nvcc 48_hopper_warp_specialized_gemm.cu -I/home/yuhangl/cutlass/include -I/home/yuhangl/cutlass/tools/util/include -I/home/yuhangl/cutlass/examples/common -arch=sm_90a -D__CUDA_ARCH_FEAT_SM90_ALL --expt-relaxed-constexpr -std=c++17 -o cutlass_test.exe 
+
 
     Examples:
 

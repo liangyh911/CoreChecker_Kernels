@@ -373,6 +373,10 @@ public:
     dim3 const block = GemmKernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);
 
+    printf("run gemm universal adapter. block\n");
+    printf("Grdi: (%d, %d, %d); Blocks: (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y, block.z);
+    // printf("%d\n", GemmKernel::ArchTag::kMinComputeCapability);
+
     // configure smem size and carveout
     int smem_size = GemmKernel::SharedStorageSize;
 
@@ -464,6 +468,7 @@ public:
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
             CUTLASS_TRACE_HOST("GemmUniversal::run: Launching dynamic cluster kernel");
 #endif
+            // printf("473\n");
             launch_result = ClusterLauncher::launch(
               grid, cluster, block, smem_size, stream, kernel, kernel_params, launch_with_pdl);
           }

@@ -232,6 +232,13 @@ struct Gemm {
     return chk_blk;
   }
 
+  __device__ int get_checksum_smid(int chk_blk, int grid_tiled_shape_m, int matrix_shape_m, int matrix_SM, int chksum_SM){
+    int n = chk_blk / grid_tiled_shape_m;
+    int new_chk_blk_idx = chk_blk - (n+1) * matrix_shape_m;
+    int chk_smid = matrix_SM + (new_chk_blk_idx % chksum_SM);
+    return chk_smid;
+  }
+
   __device__ void SM_based_schedule(Params const &params, int threadblock_tile_offset_m, int threadblock_tile_offset_n,
                                     int &tmp_matrix_blk, int &tmp_chk_blk, int &tmp_flag,
                                     unsigned int smid, int block_idx, int matrix_SM, int iter, int checksumblk_per_col){
@@ -293,16 +300,33 @@ struct Gemm {
     }
   }
 
+  // __device__ void SM_based_schedule_v2(Params const &params, int threadblock_tile_offset_m, int threadblock_tile_offset_n,
+  //                                 int &tmp_matrix_blk, int &tmp_chk_blk,
+  //                                 unsigned int smid, int block_idx, int matrix_SM, int checksumblk_per_col){
+  
+  //   int new_blk_idx = block_idx - threadblock_tile_offset_n * checksumblk_per_col;
+  //   int group_idx = new_blk_idx / matrix_SM;
+
+  //   // int local_blk_idx = new_blk_idx % matrix_SM;
+  //   // int next_local_blk_idx = (local_blk_idx + 1) % matrix_SM;
+  //   int next_global_blk_idx = (new_blk_idx % matrix_SM + 1) % matrix_SM + (group_idx * matrix_SM);
+  //   int new_offset_n = (next_global_blk_idx / (params.grid_tiled_shape.m() - checksumblk_per_col)) * checksumblk_per_col;
+  //   tmp_matrix_blk = next_global_blk_idx + new_offset_n;
+
+  //   tmp_chk_blk = get_corresponding_chk_idx(params.grid_tiled_shape.m(), tmp_matrix_blk, threadblock_tile_offset_m, (params.grid_tiled_shape.m() - checksumblk_per_col));
+  // }
+  
   __device__ void SM_based_schedule_v2(Params const &params, int threadblock_tile_offset_m, int threadblock_tile_offset_n,
                                   int &tmp_matrix_blk, int &tmp_chk_blk,
-                                  unsigned int smid, int block_idx, int matrix_SM, int checksumblk_per_col){
+                                  unsigned int smid, int block_idx, int matrix_SM, int checksumblk_per_col, int offset){
   
     int new_blk_idx = block_idx - threadblock_tile_offset_n * checksumblk_per_col;
     int group_idx = new_blk_idx / matrix_SM;
 
     // int local_blk_idx = new_blk_idx % matrix_SM;
     // int next_local_blk_idx = (local_blk_idx + 1) % matrix_SM;
-    int next_global_blk_idx = (new_blk_idx % matrix_SM + 1) % matrix_SM + (group_idx * matrix_SM);
+    int next_global_blk_idx = (new_blk_idx % matrix_SM + offset) % matrix_SM + (group_idx * matrix_SM);
+    // int next_global_blk_idx = (new_blk_idx % matrix_SM + 1) % matrix_SM + (group_idx * matrix_SM);
     int new_offset_n = (next_global_blk_idx / (params.grid_tiled_shape.m() - checksumblk_per_col)) * checksumblk_per_col;
     tmp_matrix_blk = next_global_blk_idx + new_offset_n;
 
@@ -371,7 +395,7 @@ struct Gemm {
   }
 
   __device__ void check_phase(Params const &params, int matrix_start_idx, int chk_start_idx, int *SM_check_res, 
-                              unsigned int smid
+                              unsigned int smid, unsigned int target_smid, unsigned int chksum_smid
                               // int iter, int *recompute, int *compare, int *checking
                               // int thread_idx, int next_matrix_block_idx, int next_chk_block_idx, int block_idx
                             ){
@@ -399,8 +423,11 @@ struct Gemm {
       diff = 1;
       float max = (recomputed_chksum > updated_chksum) ? recomputed_chksum : updated_chksum;
       float rel_err = fabs(recomputed_chksum - updated_chksum) / max;
-      printf("recompute: %f, checksum: %f, diff: %f rel err: %f\n", 
-              recomputed_chksum, updated_chksum, fabs(recomputed_chksum - updated_chksum), rel_err);
+      // printf("Error detected at SM %d by checker SM %d. Checksum SM %d. recompute: %f, checksum: %f, diff: %f rel err: %f\n", 
+      //         target_smid, smid, chksum_smid, recomputed_chksum, updated_chksum, fabs(recomputed_chksum - updated_chksum), rel_err);
+
+      // printf("recompute: %f, checksum: %f, diff: %f rel err: %f\n", 
+      //         recomputed_chksum, updated_chksum, fabs(recomputed_chksum - updated_chksum), rel_err);
 
       // printf("%d Difference detected at (%d, %d, %d). next matrix sum: (%d, %f), next chk: (%d, %f)\n", 
       //           iter, smid, block_idx, thread_idx, next_matrix_block_idx, recomputed_chksum, next_chk_block_idx, *(params.ref_D.data() + chk_start_idx));
@@ -412,8 +439,11 @@ struct Gemm {
 
     // Atomic sum
     if(diff != 0){
-      printf("Difference detected at SM %d. Reduced Sum: %d\n", smid, *(SM_check_res+smid));
+      // printf("Difference detected at SM %d. Reduced Sum: %d\n", smid, *(SM_check_res+smid));
+      // printf("%d Error detected at SM %d by checker SM %d. Checksum SM %d\n", i, targe_smid, smid, checksum_smid);
       atomicAdd((SM_check_res + smid), diff);
+      atomicAdd((SM_check_res + target_smid), diff);
+      atomicAdd((SM_check_res + chksum_smid), diff);
     }
     __syncthreads();
     // if(*(SM_check_res+smid)!=0){
@@ -430,13 +460,32 @@ struct Gemm {
     // }
   }
 
+  template <typename T>
+  __device__ void force_bit_one_bf16(T *dA, int bit){ 
+    // 30 or 29
+    float orgValue = static_cast<float>(*dA);
+    // float tmp = orgValue;
+    // printf("%.4f ", orgValue);
+    
+    uint32_t intValue = *reinterpret_cast<uint32_t*>(&orgValue);
+    uint16_t bf16_bits = static_cast<uint16_t>(intValue >> 16);
+    bf16_bits |= (1u << bit);
+    // *intValue &= ~ ((1u << bit));
+
+    uint32_t new_int_value = (static_cast<uint32_t>(bf16_bits) << 16);
+    float new_float = *reinterpret_cast<float*>(&new_int_value);
+    *dA = static_cast<cutlass::bfloat16_t>(new_float);
+    // printf("%.4f ", *(dA));
+  }
+
   /// Executes one GEMM
   CUTLASS_DEVICE
   void operator()(Params const &params, SharedStorage &shared_storage, 
-                  int if_split_phase, int *SM_check_res, int partion
+                  int if_split_phase, int *SM_check_res, int partion, int SchTCC_mode, bool injection,
+                  int faulty_smid, int *faulty_MMAs, int *faulty_elements, int faulty_bit
                   // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking
                 ) {
-
+    // bool injection = false;
     // get SM id
     unsigned int smid, nsmid;
     asm volatile("mov.u32 %0, %smid;" : "=r"(smid));
@@ -474,7 +523,9 @@ struct Gemm {
     int SM_iter = (int)ceil((double)((matrix_shape_m * params.grid_tiled_shape.n())/(double)matrix_SM));
     int matrix_block_count = matrix_shape_m * params.grid_tiled_shape.n();
 
-    int targe_smid = (smid + 1) % matrix_SM;
+    int check_iter = (SchTCC_mode == 2) ? 3 : SM_iter;
+
+    // int targe_smid = (smid + 1) % matrix_SM;
 
     // int matrix_next_blk_offset_m = matrix_SM / matrix_shape_n;
     // int matrix_next_blk_offset_n = matrix_SM % matrix_shape_n;
@@ -749,6 +800,30 @@ struct Gemm {
       // Execute the epilogue operator to update the destination tensor.
       epilogue(output_op, iterator_D, accumulators, iterator_C); 
 
+      // Fault Injection
+      if(smid == faulty_smid && thread_idx == 0){
+        // int mma_grid_m = params.problem_size.m() / 16;
+        // int mma_grid_n = params.problem_size.n() / 8;
+        int N = params.problem_size.n();
+        // int c = 0;
+        for(int i = 0; i < 64; i++){
+          int mma_m = (threadblock_tile_offset_m * 128) + (faulty_MMAs[i] % 8) * 16;
+          int mma_n = (threadblock_tile_offset_n * 256) + (faulty_MMAs[i] / 8) * 8;
+
+          // index of 1st faulty element
+          int fault_m = faulty_elements[i] % 8;
+          int fault_n = faulty_elements[i] / 8;
+          int idx = (mma_m + fault_m) * N + (mma_n + fault_n);
+          force_bit_one_bf16((params.ref_D.data()+idx), faulty_bit);
+
+          // index of 2nd faulty element (gap is 64)
+          fault_m += 8;
+          idx = (mma_m + fault_m) * N + (mma_n + fault_n);
+          force_bit_one_bf16((params.ref_D.data()+idx), faulty_bit);
+        }
+      }
+      __syncthreads();
+
       // Simulate compute matrix error
       // if(smid == 0){
       //   if(thread_idx == 0){
@@ -820,7 +895,7 @@ struct Gemm {
     //   continue;
     // }
     // else if(iter == (*((SM_schedule)+6))-1){
-    //   cooperative_groups::this_grid().sync();
+    if(injection) cooperative_groups::this_grid().sync();
     // }
     
     // __syncthreads();
@@ -830,7 +905,9 @@ struct Gemm {
     // }
     #if 1
     if(if_split_phase == 0){
-      if(iter == 0 && SM_iter != 1){
+      if(SchTCC_mode != 0){
+
+      if(iter == 0 && SM_iter != 1 || iter > check_iter){
         continue;
       }
       // overhead issue below
@@ -862,9 +939,15 @@ struct Gemm {
       // begin chkeck
       // if(flag == 1){
         if (smid < matrix_SM){
+          int target_sm_offset = iter + 1;
+          int targe_smid = (smid + target_sm_offset) % matrix_SM;
+          
           int next_matrix_block_idx, next_chk_block_idx;
-          SM_based_schedule_v2(params, threadblock_tile_offset_m, threadblock_tile_offset_n, next_matrix_block_idx, next_chk_block_idx, smid, block_idx, matrix_SM, checksumblk_per_col);
+          // SM_based_schedule_v2(params, threadblock_tile_offset_m, threadblock_tile_offset_n, next_matrix_block_idx, next_chk_block_idx, smid, block_idx, matrix_SM, checksumblk_per_col);
+          SM_based_schedule_v2(params, threadblock_tile_offset_m, threadblock_tile_offset_n, next_matrix_block_idx, next_chk_block_idx, smid, block_idx, matrix_SM, checksumblk_per_col, target_sm_offset);
 
+          int chksum_smid = get_checksum_smid(next_chk_block_idx, params.grid_tiled_shape.m(), (params.grid_tiled_shape.m() - checksumblk_per_col), matrix_SM, (nsmid - matrix_SM));
+                    
           int matrix_start_idx, chk_start_idx;
           // iter 1 ~ (n-2)
           if(iter < (SM_iter - 1) && iter > 0){
@@ -880,7 +963,7 @@ struct Gemm {
 
             // check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, iter, recompute, compare, checking, smid, thread_idx, next_matrix_block_idx, next_chk_block_idx, block_idx);
             // check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, iter, recompute, compare, checking);
-            check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid);
+            check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, targe_smid, chksum_smid);
           }
           // iter n-1
           else if(iter == SM_iter - 1){
@@ -911,7 +994,7 @@ struct Gemm {
               //   }
               // } 
 
-              check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, targe_smid);
+              check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, targe_smid, chksum_smid);
               // check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, iter, recompute, compare, checking);
               ti++;
             }
@@ -924,11 +1007,39 @@ struct Gemm {
             }
             // check current iteration
             curr_iter_chk_offsets(params, matrix_start_idx, chk_start_idx, next_matrix_block_idx, next_chk_block_idx, checksumblk_per_col, thread_idx);
-            check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, targe_smid);
+            check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, targe_smid, chksum_smid);
             // check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, ti, recompute, compare, checking);
           }
         }
-      // }
+        // else{
+        //   if(threadIdx.x == 0){
+        //     printf("reference chksum. block_idx: %d, SM: %d, \n", 
+        //         block_idx, smid);
+        //   }
+        // }
+      }
+      else{
+        cooperative_groups::this_grid().sync();
+          
+        int target_sm_offset = iter + 1;
+        int targe_smid = (smid + target_sm_offset) % matrix_SM;
+        
+        int next_matrix_block_idx, next_chk_block_idx;
+        // SM_based_schedule_v2(params, threadblock_tile_offset_m, threadblock_tile_offset_n, next_matrix_block_idx, next_chk_block_idx, smid, block_idx, matrix_SM, checksumblk_per_col);
+        SM_based_schedule_v2(params, threadblock_tile_offset_m, threadblock_tile_offset_n, next_matrix_block_idx, next_chk_block_idx, smid, block_idx, matrix_SM, checksumblk_per_col, target_sm_offset);
+
+        int chksum_smid = get_checksum_smid(next_chk_block_idx, params.grid_tiled_shape.m(), (params.grid_tiled_shape.m() - checksumblk_per_col), matrix_SM, (nsmid - matrix_SM));
+                  
+        int matrix_start_idx, chk_start_idx;
+
+        // current iteration
+        if(next_matrix_block_idx < matrix_block_count){
+          // check current iteration
+          curr_iter_chk_offsets(params, matrix_start_idx, chk_start_idx, next_matrix_block_idx, next_chk_block_idx, checksumblk_per_col, thread_idx);
+          // check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, ti, recompute, compare, checking, smid, thread_idx, next_matrix_block_idx, next_chk_block_idx, block_idx);
+          check_phase(params, matrix_start_idx, chk_start_idx, SM_check_res, smid, targe_smid, chksum_smid);
+        }
+      }
     }
     // else if(if_split_phase == 1){
     //   // *(Signature_Array + block_idx) = (uint8_t)smid;

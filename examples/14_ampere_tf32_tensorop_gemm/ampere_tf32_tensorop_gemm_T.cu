@@ -58,6 +58,7 @@ ncu -f -o transpose --set full ./outT_c_f32.exe --m=4096 --n=8192 --k=4096 --spl
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_baseline.h"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/host_tensor.h"
@@ -107,6 +108,7 @@ struct Options {
   bool help;
 
   cutlass::gemm::GemmCoord problem_size;
+  cutlass::gemm::GemmCoord problem_size_baseline;
   int batch_count;
   float alpha;
   float beta;
@@ -121,6 +123,7 @@ struct Options {
     help(false),
     // problem_size({5120, 4096, 4096}),
     problem_size({128*3, 128*3, 128*3}),
+    problem_size_baseline({72,64,72}),
     // problem_size({72,64,72}),
     batch_count(1),
     reference_check(true),
@@ -152,6 +155,10 @@ struct Options {
     
     cmd.get_cmd_line_argument("iterations", iterations);
     cmd.get_cmd_line_argument("split", if_split_phase);
+
+    problem_size_baseline.m() = problem_size.m();
+    problem_size_baseline.n() = problem_size.n();
+    problem_size_baseline.k() = problem_size.k();
 
     // // cmd.get_cmd_line_argument("partition", partition);
     // partition = problem_size.m() / 128;
@@ -265,6 +272,22 @@ using Gemm = cutlass::gemm::device::Gemm<ElementInputA,
                                          SwizzleThreadBlock,
                                          NumStages>;
 
+using Gemm_baseline = cutlass::gemm::device::GemmBaseline<ElementInputA,
+                                         LayoutInputA,
+                                         ElementInputB,
+                                         LayoutInputB,
+                                         ElementOutput,
+                                         LayoutOutput,
+                                         ElementAccumulator,
+                                         MMAOp,
+                                         SmArch,
+                                         ShapeMMAThreadBlock,
+                                         ShapeMMAWarp,
+                                         ShapeMMAOp,
+                                         EpilogueOp,
+                                         SwizzleThreadBlock,
+                                         NumStages>;
+
 template <typename Element>
 void encode_col_checksum(Element *A, int k, int n, int partition){
   int m = 1;
@@ -294,37 +317,6 @@ void encode_col_checksum(Element *A, int k, int n, int partition){
   }
   free(chk_vector);
 }
-
-// template <typename Element>
-// void encode_row_checksum(Element *A, int m, int k, int partition, int lda){
-//   int n = 1;
-//   int k_per_partion = k / partition;
-
-//   // init checksum vector
-//   Element *chk_vector;
-//   chk_vector = (Element*)malloc(sizeof(Element)* k_per_partion * 1);
-//   for(int r = 0; r < k_per_partion; r++){
-//     chk_vector[r] = (Element)1.f;
-//     // chk_vector[c + k] = (float)(c+1);
-//   }
-//   // encode row chksum - column major
-//   for(int p = 0; p < partition; p++){
-//     for(int c = 0; c < n; c++){
-//       for(int r = 0; r < m; r++){
-//         Element sum = (Element)0.0f;
-//         for(int i = 0; i < k_per_partion; i++){
-//           Element a = A[r + (i + k_per_partion * p) * lda];
-//           Element b = chk_vector[i];
-//           sum += a * b;
-//         }
-//         // int idx = (k + p) + (c * lda) + (b_idx * stride);
-//         int idx = lda * (k + p) + r;
-//         A[idx] = sum;
-//       }
-//     }
-//   }
-//   free(chk_vector);
-// }
 
 template <typename Element>
 void encode_row_checksum(Element *A, int m, int k, int partition, int lda){
@@ -382,41 +374,6 @@ int run(Options &options) {
 
   int kRange = 8;
   float DIV = 1;
-  // if(options.if_split_phase==1 || options.if_split_phase==0){
-  //   int m = 1;
-  //   int k = problem_size.m() - 1 * options.partition;
-  //   int n = problem_size.k();
-  //   // printf("begin init A %d %d, %d\n", options.partition, k, n);
-  //   for(int r = 0; r < k; r++){
-  //     for(int c = 0; c < n; c++){
-  //       int idx = r * n + c;
-  //       *(tensor_a.host_data()+idx) = (float)(idx % kRange);
-  //       // *(tensor_a.host_data()+idx) = (float)1;
-  //     }
-  //   }
-  //   encode_col_checksum<ElementInputA>(tensor_a.host_data(), k, n, options.partition);
-
-  //   n = problem_size.n();
-  //   for(int r = 0; r < k; r++){
-  //     for(int c = 0; c < n; c++){
-  //       int idx = r * n + c;
-  //       // *(tensor_c.host_data()+idx) = (float)rand()/RAND_MAX;
-  //       *(tensor_c.host_data()+idx) = (float)1;
-  //     }
-  //   }
-  //   encode_col_checksum<ElementOutput>(tensor_c.host_data(), k, n, options.partition);
-  // }
-  // else{
-  //   for(int idx = 0; idx < (problem_size.m()*problem_size.k()); idx++){
-  //     *(tensor_a.host_data()+idx) = (float)1;
-  //   }
-  //   cutlass::reference::host::TensorFill(tensor_c.host_view()); 
-  // }
-  // for(int idx = 0; idx < (problem_size.k()*problem_size.n()); idx++){
-  //   // *(tensor_b.host_data()+idx) = (float)1;
-  //   *(tensor_b.host_data()+idx) = (float)(idx % kRange);
-  // }
-
 
   if(options.if_split_phase==1 || options.if_split_phase==0){
     for(int c = 0; c < (problem_size.n() - 1 * options.partition); c++){
@@ -505,6 +462,67 @@ int run(Options &options) {
   // Result structure
   Result result;
 
+  // Instantiate CUTLASS kernel depending on templates
+  Gemm_baseline gemm_op_baseline;
+  // if(options.eval_mode == 0){
+    // baseline init
+    cutlass::gemm::GemmCoord problem_size_baseline = options.problem_size_baseline;
+    // Initialize tensors using CUTLASS helper functions
+    cutlass::HostTensor<ElementInputA, LayoutInputA> baseline_a(
+        problem_size_baseline.mk());  // <- Create matrix A with dimensions M x K
+    cutlass::HostTensor<ElementInputB, LayoutInputB> baseline_b(
+        problem_size_baseline.kn());  // <- Create matrix B with dimensions K x N
+    cutlass::HostTensor<ElementOutput, LayoutOutput> baseline_c(
+        problem_size_baseline.mn());  // <- Create matrix C with dimensions M x N
+    cutlass::HostTensor<ElementOutput, LayoutOutput> baseline_d(
+        problem_size_baseline.mn());  // <- Create matrix D with dimensions M x N used to store output from
+                            // CUTLASS kernel
+    
+    for(int idx = 0; idx < (problem_size_baseline.m()*problem_size_baseline.k()); idx++){
+      *(baseline_a.host_data()+idx) = (ElementInputA)(static_cast<float>(idx % kRange) / DIV);
+    }
+    for(int c = 0; c < problem_size_baseline.n(); c++){
+      for(int r = 0; r < problem_size_baseline.k(); r++){
+        int idx = c * problem_size_baseline.k() + r;
+        *(baseline_b.host_data()+idx) = (ElementInputB)(static_cast<float>(idx % kRange) / DIV);
+      }
+    }
+    cutlass::reference::host::TensorFill(baseline_c.host_view()); 
+    cutlass::reference::host::TensorFill(baseline_d.host_view());  // <- fill matrix D on host with zeros
+
+    printf("baseline: finish init matrix\n");
+
+    // Copy data from host to GPU
+    baseline_a.sync_device();
+    baseline_b.sync_device();
+    baseline_c.sync_device();
+    baseline_d.sync_device();
+
+    // Create a tuple of gemm kernel arguments. This is later passed as arguments to launch
+    // instantiated CUTLASS kernel
+    typename Gemm_baseline::Arguments arguments_baseline{problem_size_baseline,  // <- problem size of matrix multiplication
+                                      baseline_a.device_ref(),  // <- reference to matrix A on device
+                                      baseline_b.device_ref(),  // <- reference to matrix B on device
+                                      baseline_c.device_ref(),  // <- reference to matrix C on device
+                                      baseline_d.device_ref(),  // <- reference to matrix D on device
+                                      {alpha, beta},          // <- tuple of alpha and beta
+                                      split_k_slices};        // <- k-dimension split factor
+
+    // Using the arguments, query for extra workspace required for matrix multiplication computation
+    size_t workspace_size_baseline = Gemm_baseline::get_workspace_size(arguments_baseline);
+
+    // Allocate workspace memory
+    cutlass::device_memory::allocation<uint8_t> workspace_baseline(workspace_size_baseline);
+
+    // Check the problem size is supported or not 
+    status = gemm_op_baseline.can_implement(arguments_baseline);
+    CUTLASS_CHECK(status);
+
+    // Initialize CUTLASS kernel with arguments and workspace pointer
+    status = gemm_op_baseline.initialize(arguments_baseline, workspace_baseline.get());
+    CUTLASS_CHECK(status);
+  // }
+
   //
   // Construct events
   //
@@ -530,116 +548,35 @@ int run(Options &options) {
   // Run profiling loop
   //
 
-  // int gemm_iter = (int)ceil((double)(((options.problem_size.m() / 256)*(options.problem_size.n() / 128))/(double)132)) + 1;
-
-  // int *elapsed_compute, *elapsed_finding, *elapsed_recompute, *elapsed_compare, *elapsed_reduce;
-  // int cnt_matrix = 0, cnt_chksum = 0;
-
-  // int *all_start, *compute, *finding, *recompute, *compare, *checking, *h_SM_JOBS, *all_start_for_split;
-
-  // size_t size = sizeof(int) * gemm_iter;
-
-  // all_start = (int*)malloc(size);
-  // compute = (int*)malloc(size);
-  // finding = (int*)malloc(size);
-  // recompute = (int*)malloc(size);
-  // compare = (int*)malloc(size);
-  // checking = (int*)malloc(size);
-  // h_SM_JOBS = (int*)malloc(size);
-
-  // elapsed_compute = (int*)malloc(size);
-  // elapsed_finding = (int*)malloc(size);
-  // elapsed_recompute = (int*)malloc(size);
-  // elapsed_compare = (int*)malloc(size);
-  // elapsed_reduce = (int*)malloc(size);
-
-  // all_start_for_split = (int*)malloc(size);
-
+  float *t_compute; 
+  float runtime, runtime_D, runtime_A, runtime_baseline;
   for (int iter = 0; iter < options.iterations; ++iter) {
     // Launch initialized CUTLASS kernel
-    status = gemm_op(options.if_split_phase, options.partition);
-    // status = gemm_op(options.if_split_phase, options.partition, 
-    //                   all_start, compute, finding, recompute, compare, checking);
-    // status = gemm_op();
-    // CUTLASS_CHECK(status);
+    status = gemm_op(options.if_split_phase, options.partition, 2, t_compute);
+    runtime_A = (*t_compute) / 500;
 
-    // for(int i = 0; i < gemm_iter; i++){
-    //   elapsed_compute[i] += (compute[i]-all_start[i]);
-    //   elapsed_finding[i] += (finding[i]-all_start[i]);
-      
-    //   if(i != 0 && i == (gemm_iter-1)){
-    //     // elapsed_recompute[i] += (recompute[i]-all_start[i-1]);
-    //     // elapsed_compare[i] += (compare[i]-all_start[i-1]);
-    //     // elapsed_reduce[i] += (checking[i]-all_start[i-1]);
+    // Launch baseline CUTLASS kernel
+    cudaDeviceSynchronize();
+    status = gemm_op(options.if_split_phase, options.partition, 0, t_compute);
+    runtime = (*t_compute) / 500;
 
-    //     elapsed_recompute[i] += (recompute[i]-checking[i-1]);
-    //     elapsed_compare[i] += (compare[i]-checking[i-1]);
-    //     elapsed_reduce[i] += (checking[i]-checking[i-1]);
-    //   }
-    //   else{
-    //     // elapsed_finding[i] += (finding[i]-all_start[i]);
-    //     elapsed_recompute[i] += (recompute[i]-all_start[i]);
-    //     elapsed_compare[i] += (compare[i]-all_start[i]);
-    //     elapsed_reduce[i] += (checking[i]-all_start[i]);
-    //   }
-    // }
-  
-    // memset(all_start, 0, size);
-    // memset(compute, 0, size);
-    // memset(finding, 0, size);
-    // memset(recompute, 0, size);
-    // memset(compare, 0, size);
-    // memset(checking, 0, size);
-    // memset(h_SM_JOBS, 0, size);
-    // memset(all_start_for_split, 0, size);
+    cudaDeviceSynchronize();
+    status = gemm_op(options.if_split_phase, options.partition, 1, t_compute);
+    runtime_D = (*t_compute) / 500;
+
+    cudaDeviceSynchronize();
+    status = gemm_op_baseline(true, t_compute);
+    runtime_baseline = (*t_compute) / 500;
+    
+    float overhead = ((runtime - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %f ms, SchTCC runtime: %f ms, SchTCC overhead: %f%\n", runtime_baseline, runtime, overhead);
+    
+    overhead = ((runtime_D - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %f ms, SchTCC-D runtime: %f ms, SchTCC-D overhead: %f%\n", runtime_baseline, runtime, overhead);
+    
+    overhead = ((runtime_A - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %f ms, SchTCC-A runtime: %f ms, SchTCC-A overhead: %f%\n", runtime_baseline, runtime, overhead);
   }
-
-  // float avg_elapsed_compute = 0, avg_elapsed_finding = 0, avg_elapsed_recompute = 0, avg_elapsed_compare = 0, avg_elapsed_reduce = 0;
-  // for(int i = 0; i < gemm_iter; i++){
-  //   // avg_elapsed_compute = elapsed_compute[i] / options.iterations;
-  //   // avg_elapsed_finding = elapsed_finding[i] / options.iterations;
-  //   // avg_elapsed_recompute = elapsed_recompute[i] / options.iterations;
-  //   // avg_elapsed_compare = elapsed_compare[i] / options.iterations;
-  //   // avg_elapsed_reduce = elapsed_reduce[i] / options.iterations;
-
-  //   // printf("iter: %d, compute: %f, finding: %f, recompute: %f, compare: %f, reduce: %f\n", 
-  //   //       gemm_iter, avg_elapsed_compute, avg_elapsed_finding, avg_elapsed_recompute, avg_elapsed_compare, avg_elapsed_reduce);  
-
-
-  //   avg_elapsed_compute += elapsed_compute[i] / options.iterations;
-
-  //   if(i > 0 && i < (gemm_iter-1)){
-  //      avg_elapsed_finding += elapsed_finding[i] / options.iterations;
-  //      avg_elapsed_recompute += elapsed_recompute[i] / options.iterations;
-  //      avg_elapsed_compare += elapsed_compare[i] / options.iterations;
-  //      avg_elapsed_reduce += elapsed_reduce[i] / options.iterations;
-  //   }
-    
-  //   if(i != 0 && i == (gemm_iter-1)){
-  //     avg_elapsed_recompute += elapsed_recompute[i] / options.iterations;
-  //     avg_elapsed_compare += elapsed_compare[i] / options.iterations;
-  //     avg_elapsed_reduce += elapsed_reduce[i] / options.iterations;
-  //   }
-    
-  // }
-
-  // avg_elapsed_compute = avg_elapsed_compute / (gemm_iter-1);
-  // avg_elapsed_finding = avg_elapsed_finding / (gemm_iter-2);
-  // avg_elapsed_recompute = avg_elapsed_recompute / (gemm_iter-2);
-  // avg_elapsed_compare = avg_elapsed_compare / (gemm_iter-2);
-  // avg_elapsed_reduce = avg_elapsed_reduce / (gemm_iter-2);
-
-  // printf("compute: %f, finding: %f, recompute: %f, compare: %f, reduce: %f\n", 
-  //   avg_elapsed_compute, avg_elapsed_finding, avg_elapsed_recompute, avg_elapsed_compare, avg_elapsed_reduce);  
- 
-  // free(all_start);
-  // free(compute);
-  // free(finding);
-  // free(recompute);
-  // free(compare);
-  // free(checking);
-  // free(h_SM_JOBS);
-  // free(all_start_for_split);
 
   //
   // Stop profiling loop
@@ -708,12 +645,12 @@ int run(Options &options) {
     tensor_d.host_view(),
     tensor_ref_d.host_view());
 
-  if (passed) {
-    std::cout << "Runtime: " << result.runtime_ms << " ms" << std::endl;
-    std::cout << " GFLOPs: " << result.gflops << std::endl;
-  }
+  // if (passed) {
+  //   std::cout << "Runtime: " << result.runtime_ms << " ms" << std::endl;
+  //   std::cout << " GFLOPs: " << result.gflops << std::endl;
+  // }
 
-  std::cout << (passed ? "Passed" : "Failed") << std::endl;
+  // std::cout << (passed ? "Passed" : "Failed") << std::endl;
 
   return (passed ? 0  : -1);
 }

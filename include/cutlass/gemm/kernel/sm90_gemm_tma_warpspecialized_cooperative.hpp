@@ -337,6 +337,11 @@ public:
     using namespace cute;
     using X = Underscore;
 
+    unsigned int smid;
+    asm volatile("mov.u32 %0, %smid;" : "=r"(smid));
+    // total 120 SMs for H100 (132 SMs)
+    // if(threadIdx.x == 0) printf("run gemm tma kernel smid: %d\n", smid);
+
 #if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL))
 #  define ENABLE_SM90_KERNEL_LEVEL 1
 #endif
@@ -591,6 +596,8 @@ public:
           auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
           auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
 
+          // if(smid == 0) printf(" Mainloop Producer Warp (m: %d, n: %d, k: %d)\n", work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx);
+
           // Get the number of K tiles to compute for this work as well as the starting K tile offset of the work.
           auto work_k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, blk_shape);
           auto work_k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
@@ -702,13 +709,22 @@ public:
 
       // Do we potentially issue tail arrives for TMA stores, if epilogue load is waiting for it
       bool do_store_tail = false;
+      int count = 0;
       while (work_tile_info.is_valid()) {
+        printf("%d \n", count);
         // Compute m_coord, n_coord, l_coord with the post-tiled m-shape and n-shape
         auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
         auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
         auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
         auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
         auto work_k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, blk_shape);
+
+        // int block_idx = blockIdx.x + gridDim.x * blockIdx.y;
+        int grid_tiled_m = cute::get<0>(params.problem_shape) / 128;
+        int matrix_block_idx = m_coord + grid_tiled_m * n_coord;
+        printf("loop: %d, Mainloop Consumer Warp smid: %d (wid: %d, tid: %d), blk: %d (m: %d, n: %d, k: %d)\n", 
+              count, smid, warp_idx, thread_idx, matrix_block_idx, work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx);
+        count++;
         // Allocate the accumulators for the (M,N) blk_shape
         //
         // MSVC CTAD breaks if we say "Tensor" here, so we use "auto" instead.

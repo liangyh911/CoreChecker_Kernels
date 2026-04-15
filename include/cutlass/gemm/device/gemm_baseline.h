@@ -40,20 +40,12 @@
 #include "cutlass/device_kernel.h"
 
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
-#include "cutlass/gemm/kernel/gemm.h"
+#include "cutlass/gemm/kernel/gemm_baseline.h"
 
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/device/default_gemm_configuration.h"
 
 #include "cutlass/layout/permute.h"
-
-#include "cutlass/gemm_ring_queue.h"
-#include <cmath>
-
-#include <string>
-#include <fstream>
-#include <filesystem>
-namespace fs = std::filesystem;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -174,16 +166,6 @@ namespace device {
     >
     class Gemm;
 */
-
-// __device__ uint8_t *Signature_Array;
-// __device__ int *Lock_Signature;
-// __device__ RingQueue_v2 *d_queues;
-// __device__ int *d_buffer, *d_head, *d_tail;
-
-__device__ int *SM_check_res;
-__device__ int *d_all_start, *d_compute, *d_finding, * d_recompute, *d_compare, *d_checking, *d_SM_JOBS, *d_all_start_for_split;
-// __device__ uint8_t *ChkSum_Signature_A_Col;
-
 template <
     /// Element type for A matrix operand
     typename ElementA_,
@@ -248,7 +230,7 @@ template <
     bool ScatterD = false,
     /// Permute result D
     typename PermuteDLayout = layout::NoPermute>
-class Gemm {
+class GemmBaseline {
  public:
 
   using ElementA = ElementA_;
@@ -279,7 +261,7 @@ class Gemm {
   static ComplexTransform const kTransformB = ComplexTransform::kNone;
 
   /// Define the kernel
-  using GemmKernel = typename kernel::DefaultGemm<
+  using DefaultGemmKernel = typename kernel::DefaultGemm<
     ElementA,
     LayoutA,
     kAlignmentA,
@@ -305,6 +287,8 @@ class Gemm {
     ScatterD,
     PermuteDLayout
   >::GemmKernel;
+  
+  using GemmKernel = kernel::GemmBaseline<typename DefaultGemmKernel::Mma, typename DefaultGemmKernel::Epilogue, ThreadblockSwizzle, kSplitKSerial>;
 
   /// Argument structure
   struct Arguments {
@@ -372,7 +356,7 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmBaseline() { }
 
   /// Determines whether the GEMM can execute the given problem.
   static Status can_implement(Arguments const &args) {
@@ -450,8 +434,6 @@ public:
       }
     }
 
-    // printf("Row: stride A: %d, stride B: %d, stride C: %d\n", args.ref_A.stride(0), args.ref_B.stride(0), args.ref_C.stride(0));
-
     // Initialize the Params structure
     params_ = typename GemmKernel::Params{
       args.problem_size,
@@ -489,10 +471,32 @@ public:
     return Status::kSuccess;
   }
 
+  void recordTime(std::string FP, float time, bool DEBUG){
+    std::ofstream outFile(FP, std::ios::app);
+    if(!outFile){
+      std::cerr << "Failed to open the file for appending." << std::endl;
+      return;
+    }
+    outFile << time << std::endl;
+    // if(DEBUG) printf("Data appended to the file successfully.\n");
+  }
+
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-              // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-              cudaStream_t stream = nullptr) {
+  Status run(bool DEBUG, float *t_compute, cudaStream_t stream = nullptr) {
+    
+    // fs::path destinationFile, fullPath;
+    // const char* homeDir = nullptr;
+    // homeDir = getenv("HOME");
+    // fs::path homePath(homeDir);
+
+    char *job_id = getenv("SLURM_JOB_ID");
+    int gpu_dev = -1;
+    cudaGetDevice(&gpu_dev);
+
+    // int num_sms = 132;
+    // int *SM_check_res;
+    // cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
+    // cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
 
     ThreadblockSwizzle threadblock_swizzle;
 
@@ -504,7 +508,7 @@ public:
     int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
 
     if (smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(Kernel_GEMM<GemmKernel>,
+      result = cudaFuncSetAttribute(Kernel<GemmKernel>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     smem_size);
 
@@ -513,221 +517,41 @@ public:
       }
     }
 
-    // Fault Injection Info
-    char flag;
-    bool injection = false;
-    // int faulty_smid = -1, faulty_tid_1 = -1, faulty_tid_2 = -1, faulty_bit = -1;
-
-    int faulty_smid = -1, faulty_bit = -1, *h_faulty_MMAs, *d_faulty_MMAs, *h_faulty_elements, *d_faulty_elements;
-    size_t faulty_size = sizeof(int) * 64;
-
-    h_faulty_MMAs = (int*)malloc(faulty_size);
-    h_faulty_elements = (int*)malloc(faulty_size);
-    cudaMalloc((void**)&d_faulty_MMAs, faulty_size);
-    cudaMemset(d_faulty_MMAs, -1, faulty_size);
-    cudaMalloc((void**)&d_faulty_elements, faulty_size);
-    cudaMemset(d_faulty_elements, -1, faulty_size);
-
-    int gpu_dev = -1;
-    cudaGetDevice(&gpu_dev);
-
-    // get sm count 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, gpu_dev);
-    int num_sms = prop.multiProcessorCount;
-
-    // fs::path FIInfoPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "fi_info.bin";
-    fs::path destinationFile = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "FI.txt";
-
-    std::ifstream FIFile(destinationFile);
-    if(FIFile.is_open()){
-      FIFile.get(flag);
-      if(flag == 't'){
-        injection = true;
-        // printf("Perform Fault Injection.\n");
-        // Relative Path
-        fs::path planPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "plan.txt";
-        std::ifstream planFile(planPath);
-        if(planFile.is_open()){
-          std::string line;
-          // while (std::getline(planFile, line)) {
-            
-          if (!std::getline(planFile, line)) {
-              std::cerr << "File is empty" << std::endl;
-              return Status::kErrorInternal;
-          }
-
-          std::stringstream ss(line);
-          std::string token;
-          std::vector<int> nums;
-
-          while (std::getline(ss, token, ' ')) {
-              nums.push_back(std::stoi(token));
-          }
-
-          if (nums.size() != 129) {
-              printf("Error: expected 129 numbers but got %ld\n", nums.size());
-              return Status::kErrorInternal;
-          }
-
-          int idx = 0;
-          faulty_smid = nums[idx++];
-          faulty_smid = faulty_smid % num_sms;
-          // printf("faulty SM: %d, faulty MMA: ", faulty_smid);
-
-          for (int i = 0; i < 64; i++){
-            h_faulty_MMAs[i] = nums[idx++];
-            // printf("%d ", h_faulty_MMAs[i]);
-          }
-
-          // printf("faulty elements: ");
-          for (int i = 0; i < 64; i++){
-            h_faulty_elements[i] = nums[idx++];
-            // printf("%d ", h_faulty_elements[i]);
-          }
-          // printf("\n");
-              
-          // }
-
-          cudaMemcpy(d_faulty_MMAs, h_faulty_MMAs, faulty_size, cudaMemcpyHostToDevice);
-          cudaMemcpy(d_faulty_elements, h_faulty_elements, faulty_size, cudaMemcpyHostToDevice);
-        }
-        else{
-          printf("plan: Cannot open file, using default setting.\n");
-        }
-        planFile.close();
-
-        // read faulty bit
-        // std::ifstream bitFile("/home/yuhangl/control/bit.txt");
-        // Absolute Path
-        // fs::path bitPath = fs::path("/home/yuhangl") / ("control_" + std::to_string(gpu_dev)) / "bit.txt";
-        // Relative Path
-        fs::path bitPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "bit.txt";
-        std::ifstream bitFile(bitPath);
-        if(bitFile.is_open()){
-          if (bitFile >> faulty_bit) {
-              // std::cout << "faulty_bit = " << faulty_bit << std::endl;
-          }
-        }
-        else{
-          printf("bit: Cannot open file, using default setting.\n");
-        }
-        bitFile.close();
-      }
-      // std::cout << "faulty_smid = " << faulty_smid << ", faulty_tid = " << faulty_tid << " " << "faulty_bit = " << faulty_bit << std::endl;
-    }
-    else{
-      printf("FI: Cannot open file, using default setting.\n");
-    }
-    FIFile.close();
-
-    // printf("smem_size: %d\n", smem_size);
-
-    // 0-no split; 1-split; 2-only abft
-    // int if_split_phase = 0;
-
-    // printf("m: %d, n: %d, k: %d, log: %d\n", params_.problem_size.m(), params_.problem_size.n(), params_.problem_size.k(), params_.swizzle_log_tile);
-    // std::cout << std::is_same<LayoutA_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutB_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutC_, cutlass::layout::RowMajor>::value <<std::endl;
-
-    // // unsigned int nsmid;
-    // cudaDeviceProp prop;
-    // cudaGetDeviceProperties(&prop, 0);
-    // int num_sms = prop.multiProcessorCount;
-
-    // printf("SM count: %d\n", num_sms);
-
-    cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
-    cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
-
-    // bool deBug = !injection;
-    int iterations = 0 ? injection : 500;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    *t_compute = 0;
-    // dim3 new_block(64,1,1);
-    // dim3 new_grid(12,11,1);
-    dim3 new_grid(num_sms, 1, 1);
-
-    // void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion
-    //             // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    //           };
-
-    void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion, &SchTCC_mode, &injection,
-                &faulty_smid, &d_faulty_MMAs, &d_faulty_elements, &faulty_bit
-                // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    };
-
-
     cutlass::arch::synclog_setup();
-
-    // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-    //                                                                 Lock_Signature, final_sum, if_split_phase, 
-    //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-    //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
-
-    cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
     
-    // Grdi: (4, 3, 1); Blocks: (128, 1, 1) when (386, 384, 384)
-    // printf("Grdi: (%d, %d, %d); Blocks: (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y, block.z);
-    cudaDeviceSynchronize();
-    if(!injection){
+    cudaEvent_t start, stop;
+    if(DEBUG){
+      cudaEventCreate(&start);
+      cudaEventCreate(&stop);
       cudaEventRecord(start, stream);
     }
-    for(int i = 0; i < iterations; i++){
-      // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-      //                                                                 Lock_Signature, final_sum, if_split_phase, 
-      //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-      //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
-      
-      cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
+    *t_compute = 0;
+
+    for(int i = 0; i < 500; i++){
+      cutlass::Kernel<GemmKernel><<<grid, block, smem_size, stream>>>(params_);
     }
-    if(!injection){
+
+    if(DEBUG){
       cudaEventRecord(stop, stream);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(t_compute, start, stop);
-      // printf("compute kernel time: %f\n", (*t_compute)/iterations);
+      // destinationFile = fs::path("./control_" + std::string(job_id) + "/" + std::to_string(gpu_dev)) / "time/gemm.txt";
+      // recordTime(destinationFile, t_compute, true);
+      // printf("baseline compute kernel time: %f\n", (*t_compute)/500);
     }
+
+    // cudaFree(SM_check_res);
+
     result = cudaGetLastError();
-
-    cudaDeviceSynchronize();
-    
-    // // copy back SM check results
-    if(injection){
-      int *h_SM_check_res;
-      h_SM_check_res = (int*)malloc(num_sms * sizeof(int));
-      cudaMemcpy(h_SM_check_res, SM_check_res, num_sms*sizeof(int), cudaMemcpyDeviceToHost);
-      // record checking results
-      // int gpu_dev = -1;
-      // cudaGetDevice(&gpu_dev);
-      // char *job_id = getenv("SLURM_JOB_ID");
-      fs::path SMCheckResPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
-      std::ofstream ofs(SMCheckResPath, std::ios::out | std::ios::app);
-      // ofs.write(reinterpret_cast<const char*>(h_SM_check_res), sizeof(int) * num_sms);
-      for (int i = 0; i < num_sms; i++) {
-          ofs << h_SM_check_res[i];
-          if (i != num_sms - 1)
-              ofs << " ";
-      }
-      ofs << "\n";
-      free(h_SM_check_res);
-    }
-
-    cudaFree(SM_check_res);
-
-    cudaFree(d_faulty_MMAs);
-    cudaFree(d_faulty_elements);
-    free(h_faulty_MMAs);
-    free(h_faulty_elements);
 
     return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, stream);
+  Status operator()(cudaStream_t stream = nullptr) {
+    return run(stream);
   }
- 
+
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
@@ -793,7 +617,7 @@ template <
     /// Permute result D
     typename PermuteDLayout
 >
-class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
+class GemmBaseline<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
            layout::ColumnMajor,  // partially specialized on LayoutC
            ElementAccumulator_, OperatorClass_, ArchTag_, ThreadblockShape_,
            WarpShape_, InstructionShape_, EpilogueOutputOp_,
@@ -827,7 +651,7 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
   static ComplexTransform const kTransformB = ComplexTransform::kNone;
   static bool const kSplitKSerial = SplitKSerial;
 
-  using UnderlyingOperator = Gemm< 
+  using UnderlyingOperator = GemmBaseline< 
     ElementB,
     typename layout::LayoutTranspose<LayoutB>::type,
     ElementA,
@@ -918,11 +742,10 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmBaseline() { }
 
   /// Helper to construct a transposed equivalent for the underying GEMM operator
   static UnderlyingArguments to_underlying_arguments(Arguments const &args) {
-    // printf("Col: stride A (ldA): %d, stride B (ldB): %d, stride C (ldC): %d\n", args.ref_A.stride(0), args.ref_B.stride(0), args.ref_C.stride(0));
     return UnderlyingArguments(
       {args.problem_size.n(), args.problem_size.m(), args.problem_size.k()},
       {args.ref_B.data(), args.ref_B.stride(0)},
@@ -962,22 +785,14 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-            // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking, 
-            cudaStream_t stream = nullptr) {
+  Status run(bool DEBUG, float *t_compute, cudaStream_t stream = nullptr) {
 
-    return underlying_operator_.run(if_split_phase, partion, SchTCC_mode, t_compute,
-                                    // all_start, compute, finding, recompute, compare, checking, 
-                                    stream);
+    return underlying_operator_.run(DEBUG, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-                    // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-                    cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, SchTCC_mode, t_compute,
-                // all_start, compute, finding, recompute, compare, checking, 
-                stream);
+  Status operator()(bool DEBUG, float *t_compute, cudaStream_t stream = nullptr) {
+    return run(DEBUG, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.

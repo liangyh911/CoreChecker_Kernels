@@ -102,11 +102,19 @@ matrix B can be seen as
 , where the batch size is 2, N is 3 and K is 2
 The stride (batch_stride_B) between the first element of two batches is k
 
-nvcc ampere_bf16_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -o bout_bf16.exe
+nvcc ampere_bf16_batched_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -o boutT_bf16.exe
 
-nvcc ampere_bf16_batched_gemm.cu -O0 -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90 -o bloutT_bf16.exe
+nvcc ampere_bf16_batched_gemm_T.cu -O0 -I$HOME/origin_cutlass/sm89_test/cutlass/include -I$HOME/origin_cutlass/sm89_test/cutlass/tools/util/include -I$HOME/origin_cutlass/sm89_test/cutlass/examples/common -arch=sm_90 -o bloutT_bf16.exe
 
-ncu -f -o batchPipe --set full ./bout_bf16.exe --m=128 --n=1024 --k=1024 --batch=256 --split=1 --iterations=1 --validate=1
+ncu -f -o batchPipe --set full ./boutT_bf16.exe --m=1024 --n=1024 --k=128 --batch=4 --split=1 --iterations=1 --validate=1
+
+nvcc ampere_bf16_batched_gemm_T_encode_A.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o boutT_bf16_A.exe
+
+./boutT_bf16_A.exe --m=1024 --n=1024 --k=128 --batch=256 --split=1 --iterations=1 --validate=0 --monitored=8
+
+mma cutlass/include/arch/mma.h  Matrix multiply-add operation - F32 = bf16 * bf16 + F32
+mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
+SM80_16x8x8_F32BF16BF16F32_TN
 */
 
 // Command line options parsing
@@ -126,8 +134,11 @@ struct Options {
   int if_split_phase;
 
   int validation;
+  int padding;
 
   int monitored;
+
+  int chksum_mode;
   
   Options():
     help(false),
@@ -137,10 +148,12 @@ struct Options {
     iterations(1),
     alpha(1),
     beta(0),
-    partition(),
+    partition(1),
     if_split_phase(2),
     validation(0),
-    monitored(0) { }
+    padding(8),
+    monitored(0),
+    chksum_mode(1){ }
 
   // bool valid() {
   //   return true;
@@ -167,16 +180,24 @@ struct Options {
     cmd.get_cmd_line_argument("split", if_split_phase);
 
     cmd.get_cmd_line_argument("validate", validation);
+    cmd.get_cmd_line_argument("padding", padding);
 
     cmd.get_cmd_line_argument("monitored", monitored);
 
+    cmd.get_cmd_line_argument("chksum_mode", chksum_mode);
+
     // cmd.get_cmd_line_argument("partition", partition);
-    partition = 1;
 
     // add checksum size
     if(if_split_phase == 1 || if_split_phase == 0){
-      problem_size.n() += partition * 2;
-      // problem_size.n() += 16;
+      // problem_size.n() += partition * 2;
+      if(chksum_mode == 1){
+        partition = problem_size.n() / 128;
+        problem_size.n() += padding;
+      }
+      else{
+        problem_size.m() += padding;
+      }
     }
     if(monitored == 0){
       monitored = batch_count;
@@ -200,7 +221,9 @@ struct Options {
       << "  --partition=<int>           Number of partition of the matrix.\n\n"
       << "  --split=<int>               0-no split, 1-split, 2-baseline.\n\n"
       << "  --validate=<int>            0-no validate, 1-validate\n\n"
-      << "  --monitored=<int>           Number of ABFT monitored batches.";
+      << "  --padding=<int>             Number of checksum padding. 8 or 16"
+      << "  --monitored=<int>           Number of ABFT monitored batches."
+      << "  --chksum_mode=<int>         0-column checksum, 1-row checksum (cutlass level)";
 
     out << "\n\nExamples:\n\n"
       << "$ ./examples/14_ampere_tf32_tensorop_gemm/14_ampere_tf32_tensorop_gemm --m=1024 --n=512 --k=1024 \\\n"
@@ -282,10 +305,11 @@ cudaError_t cutlass_strided_batched_sgemm(
   int batch_count,
   int if_split_phase,
   int partition,
-  int monitored) {
+  int monitored,
+  int chksum_mode) {
 
   using Gemm = cutlass::gemm::device::GemmBatched<
-    ElementInputA, cutlass::layout::ColumnMajor,
+    ElementInputA, cutlass::layout::RowMajor,
     ElementInputB, cutlass::layout::ColumnMajor,
     ElementOutput, cutlass::layout::ColumnMajor,
     ElementAccumulator,
@@ -335,33 +359,33 @@ cudaError_t cutlass_strided_batched_sgemm(
   printf("monitored batches num: %d\n", monitored);
 
   cutlass::Status status = gemm_op({
-    {m, n, k},
-    {A, lda}, 
-    batch_stride_A,
-    {B, ldb}, 
-    batch_stride_B,
-    {C, ldc}, 
-    batch_stride_C,
-    {C, ldc}, 
-    batch_stride_C,
-    {alpha, beta},
-    batch_count},
-
-    // {
-    //   {m, 16, k},
-    //   {A, lda}, 
-    //   batch_stride_A,
-    //   {(B + (ldb * n)), ldb}, 
-    //   batch_stride_B,
-    //   {(C + (ldc * n)), ldc}, 
-    //   batch_stride_C,
-    //   {(C + (ldc * n)), ldc}, 
-    //   batch_stride_C,
-    //   {alpha, beta},
-    //   batch_count},
+      {m, n, k},
+      {A, lda}, 
+      batch_stride_A,
+      {B, ldb}, 
+      batch_stride_B,
+      {C, ldc}, 
+      batch_stride_C,
+      {C, ldc}, 
+      batch_stride_C,
+      {alpha, beta},
+      batch_count},
       
-    if_split_phase, partition, monitored, 0,
-    stream
+      // {
+      //   {m, 16, k},
+      //   {A, lda}, 
+      //   batch_stride_A,
+      //   {(B + (ldb * n)), ldb}, 
+      //   batch_stride_B,
+      //   {(C + (ldc * n)), ldc}, 
+      //   batch_stride_C,
+      //   {(C + (ldc * n)), ldc}, 
+      //   batch_stride_C,
+      //   {alpha, beta},
+      //   batch_count},
+
+      if_split_phase, partition, monitored, 1, chksum_mode,
+      stream
   );
 
   if (status != cutlass::Status::kSuccess) {
@@ -412,11 +436,9 @@ cudaError_t strided_batched_gemm_nn_reference(
       for (int m_idx = 0; m_idx < m; m_idx++) {
         float accum = static_cast<float>(beta * C[batch_idx * batch_stride_C + n_idx * ldc + m_idx]);
         for (int k_idx = 0; k_idx < k; k_idx++) {
-          // accum += alpha 
-          //   * A[batch_idx * batch_stride_A + k_idx * lda + m_idx]
-          //   * B[batch_idx * batch_stride_B + n_idx * ldb + k_idx];
-          ElementInputA a = A[batch_idx * batch_stride_A + k_idx * lda + m_idx];
-          ElementInputB b = B[batch_idx * batch_stride_B + n_idx * ldb + k_idx];  
+          // T a = A[batch_idx * batch_stride_A + k_idx * lda + m_idx];
+          ElementInputA a = A[batch_idx * batch_stride_A + m_idx * lda + k_idx];
+          ElementInputB b = B[batch_idx * batch_stride_B + n_idx * ldb + k_idx];
           accum += static_cast<float>(alpha * a * b);
         }
         C[batch_idx * batch_stride_C + n_idx * ldc + m_idx] = static_cast<ElementOutput>(accum);
@@ -467,32 +489,44 @@ void outputChk(std::vector<T> &A, int64_t nb, int64_t ld, int64_t stride, int64_
   }
 }
 
+template<typename T>
+void outputChk_row_major(std::vector<T> &A, int64_t nb, int64_t ld, int64_t stride, int64_t row, int64_t col){
+  for(int i = 0; i < nb; i++){
+    printf("[ \n");
+    for(int r = 0; r < row; r++){
+      printf("|");
+      for(int c = 0; c < col; c++){
+        printf("%.6f",static_cast<float>(A[i*stride + r*ld + c]));
+        printf(", ");
+      }
+      printf("!\n");
+    }
+    printf("]\n");
+  }
+}
+
 template <typename Element>
 void encode_col_checksum(std::vector<Element> &A, int k, int n, int partition, int b_idx, int stride, int lda){
-  int m = 1;
+  int m = 2;
   // init checksum vector
-  Element *chk_vector;
-  chk_vector = (Element*)malloc(sizeof(Element)* k * 1);
+  float *chk_vector;
+  chk_vector = (float*)malloc(sizeof(float)* k * m);
   for(int c = 0; c < k; c++){
-    chk_vector[c] = (Element)1;
-    // chk_vector[c + k] = (float)(c+1);
+    chk_vector[c] = (float)1;
+    chk_vector[c + k] = (float)(c+1);
   }
-  // encode chksum - column major
-  int k_per_partion = k / partition;
-  for(int p = 0; p < partition; p++){
-    for(int c = 0; c < n; c++){
-      for(int r = 0; r < m; r++){
-        Element sum = (Element)0.0f;
-        for(int i = 0; i < k_per_partion; i++){
-          Element a = chk_vector[r + i * m];
-          Element b = A[(i + k_per_partion * p) + c * lda + (b_idx * stride)];
-          sum += a * b;
+
+  for (int r = 0; r < m; r++) {
+    for (int c = 0; c < n; c++) {
+        float sum = (float)0.0;
+        for (int i = 0; i < k; i++) {
+            float a = chk_vector[r * k + i];
+            float b = static_cast<float>(A[i * lda + c + b_idx * stride]);
+            sum += a * b;
         }
-        int idx = (k + p) + (c * lda) + (b_idx * stride);
-        A[idx] = sum;
-      }
+        A[(k + r) * lda + c + b_idx * stride] = static_cast<Element>(sum);
     }
-  }
+  }  
   free(chk_vector);
 }
 
@@ -528,30 +562,65 @@ void encode_row_checksum(std::vector<Element> &A, int m, int k, int partition, i
   free(chk_vector);
 }
 
+template <typename Element>
+void encode_row_checksum_multi(std::vector<Element> &A, int m, int k, int partition, int b_idx, int stride, int lda){
+  int n = 1;
+  int k_per_partion = k / partition;
+
+  // init checksum vector
+  float *chk_vector;
+  chk_vector = (float*)malloc(sizeof(float)* k_per_partion * n);
+  for(int r = 0; r < k_per_partion; r++){
+    chk_vector[r] = float(1);
+    // chk_vector[k_per_partion + r] = float(r + 1);
+  }
+
+  // encode row chksum - column major
+  for(int p = 0; p < partition; p++){
+    for(int c = 0; c < n; c++){
+      for(int r = 0; r < m; r++){
+        float sum = float(0.0f);
+        for(int i = 0; i < k_per_partion; i++){
+          float a = static_cast<float>(A[r + (i + k_per_partion * p) * lda + (b_idx * stride)]);
+          float b = chk_vector[i + c * k_per_partion];
+          sum += a * b;
+        }
+        // int idx = (k + p) + (c * lda) + (b_idx * stride);
+        int idx = (lda * (k + p)) + (r + c * m + (b_idx * stride));
+        A[idx] = static_cast<Element>(sum);
+      }
+    }
+  }
+  free(chk_vector);
+}
+
 cudaError_t run_batched_gemm(bool use_array, Options &options) {
 
   const char* gemm_desc = use_array ? "array" : "strided batched";
   std::cout << "Running " << gemm_desc << " gemm" << std::endl;
 
   // Arbitrary problem size
-  int const m = options.problem_size.m();
+  // int const m = options.problem_size.m();
   // int const n = options.problem_size.n();
   int const k = options.problem_size.k();
   int const batch_count = options.batch_count;
 
   // A, B are non-transpose, column major
-  int const lda = m;
+  // int const lda = m;
+  int const lda = k;
   // int const ldb = k * batch_count;
   int const ldb = k;
-  int const ldc = m;
+  int const ldc = options.problem_size.m();
 
-  int const count_A = batch_count * lda * k;
+  // int const count_A = batch_count * lda * k;
+  int const count_A = batch_count * lda * options.problem_size.m();
   // int const count_B = ldb * n;
   int const count_B = batch_count * ldb * options.problem_size.n();
   int const count_C = batch_count * ldc * options.problem_size.n();
 
   // the memory is batched along K dimension
-  long long int batch_stride_A = static_cast<long long int>(lda) * static_cast<long long int>(k);
+  // long long int batch_stride_A = static_cast<long long int>(lda) * static_cast<long long int>(k);
+  long long int batch_stride_A = static_cast<long long int>(lda) * static_cast<long long int>(options.problem_size.m());
   // long long int batch_stride_B = static_cast<long long int>(k);
   long long int batch_stride_B = static_cast<long long int>(ldb) * static_cast<long long int>(options.problem_size.n());
   long long int batch_stride_C = static_cast<long long int>(ldc) * static_cast<long long int>(options.problem_size.n());
@@ -591,49 +660,102 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
 
   // Limit range to avoid floating-point errors
   int const kRange = 8;
-  float const DIV = 1;
+  float const DIV = 10;
+
+  // // fill A
+  // for (int b_idx = 0; b_idx < batch_count; b_idx++) {
+  //   for (int col_idx = 0; col_idx < k; col_idx++) {
+  //     for (int row_idx = 0; row_idx < m; row_idx++) {
+  //       host_A[row_idx + col_idx * lda + b_idx * lda * k] = static_cast<float>((row_idx + col_idx * lda + b_idx * lda * k) % kRange) / DIV;
+  //       // host_A[row_idx + col_idx * lda + b_idx * lda * k] = 1.f;
+  //     }
+  //   }
+  //   // if(options.if_split_phase == 1 || options.if_split_phase == 0){
+  //   //   encode_col_checksum(host_A, (m-1*options.partition), k, options.partition, b_idx, batch_stride_A, lda);
+  //   // }
+  // }
+  // // outputChk(host_A, batch_count, lda, batch_stride_A, m, k);
 
   // fill A
-  for (int b_idx = 0; b_idx < batch_count; b_idx++) {
-    for (int col_idx = 0; col_idx < k; col_idx++) {
+  if(options.chksum_mode == 1){
+    int m = options.problem_size.m();
+    for (int b_idx = 0; b_idx < batch_count; b_idx++) {
       for (int row_idx = 0; row_idx < m; row_idx++) {
-        host_A[row_idx + col_idx * lda + b_idx * lda * k] = static_cast<ElementInputA>(static_cast<float>((row_idx + col_idx * lda + b_idx * lda * k) % kRange) / DIV);
-        // host_A[row_idx + col_idx * lda + b_idx * lda * k] = static_cast<ElementInputA>(1.f);
+        for (int col_idx = 0; col_idx < k; col_idx++) {
+          host_A[col_idx + row_idx * lda + b_idx * lda * m] = static_cast<ElementInputA>(static_cast<float>((col_idx + row_idx * lda + b_idx * lda * m) % kRange) / DIV);
+          // host_A[col_idx + row_idx * lda + b_idx * lda * m] = static_cast<ElementInputA>(1.f);
+        }
       }
     }
-  }
-  // outputChk(host_A, batch_count, lda, batch_stride_A, m, options.problem_size.k());
-  
-  // fill B
-  int n1 = options.problem_size.n();
-  if(options.if_split_phase == 1 || options.if_split_phase == 0){
-    n1 = options.problem_size.n() - 2 * options.partition;
-    // n1 = options.problem_size.n() - 16;
-  }
-
-  for (int b_idx = 0; b_idx < batch_count; b_idx++) {
-    for (int col_idx = 0; col_idx < n1; col_idx++) {
-      for (int row_idx = 0; row_idx < k; row_idx++) {
-        // n = n, k = k, ldb = k * batch_count, 
-        // host_B[row_idx + col_idx * ldb + b_idx * k] = static_cast<float>(((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange);
-
-        host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>(((options.problem_size.n() + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange) / DIV);
-        // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>((row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()) % kRange) / DIV);
-        // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(1.f);
-      }
-    }
+    
+    // fill B
+    int n1 = options.problem_size.n();
     if(options.if_split_phase == 1 || options.if_split_phase == 0){
-      int chk_n = 2 * options.partition;
-      // int chk_n = 16;
-      encode_row_checksum<ElementInputB>(host_B, k, (options.problem_size.n() - chk_n), options.partition, b_idx, batch_stride_B, ldb);
+      // n1 = options.problem_size.n() - 2 * options.partition;
+      n1 = options.problem_size.n() - options.padding;
+    }
+
+    for (int b_idx = 0; b_idx < batch_count; b_idx++) {
+      for (int col_idx = 0; col_idx < n1; col_idx++) {
+        for (int row_idx = 0; row_idx < k; row_idx++) {
+          // n = n, k = k, ldb = k * batch_count, 
+          // host_B[row_idx + col_idx * ldb + b_idx * k] = static_cast<float>(((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange);
+
+          // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>(((options.problem_size.n() + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange) / DIV);
+          host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>((row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()) % kRange) / DIV);
+          // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(1.f);
+        }
+      }
+      if(options.if_split_phase == 1 || options.if_split_phase == 0){
+        // int chk_n = 2 * options.partition;
+        // int chk_n = 16;
+        // encode_row_checksum<ElementInputB>(host_B, k, (options.problem_size.n() - options.padding), options.partition, b_idx, batch_stride_B, ldb);
+        encode_row_checksum_multi<ElementInputB>(host_B, k, (options.problem_size.n() - options.padding), options.partition, b_idx, batch_stride_B, ldb);
+      }
+    }
+    // outputChk(host_B, batch_count, ldb, batch_stride_B, k, options.problem_size.n());
+
+  }
+  else{
+    int m1 = options.problem_size.m();
+    if(options.if_split_phase == 1 || options.if_split_phase == 0){
+      // n1 = options.problem_size.n() - 2 * options.partition;
+      m1 = options.problem_size.m() - options.padding;
+    }
+
+    for (int b_idx = 0; b_idx < batch_count; b_idx++) {
+      for (int row_idx = 0; row_idx < m1; row_idx++) {
+        for (int col_idx = 0; col_idx < k; col_idx++) {
+        //   host_A[col_idx + row_idx * lda + b_idx * lda * options.problem_size.m()] = static_cast<ElementInputA>(static_cast<float>((col_idx + row_idx * lda + b_idx * lda * options.problem_size.m()) % kRange) / DIV);
+          host_A[col_idx + row_idx * lda + b_idx * lda * options.problem_size.m()] = static_cast<ElementInputA>(1.f);
+        }
+      }
+      if(options.if_split_phase == 1 || options.if_split_phase == 0){
+        // int chk_n = 2 * options.partition;
+        // int chk_n = 16;
+        encode_col_checksum<ElementInputB>(host_A, (options.problem_size.m() - options.padding), k, options.partition, b_idx, batch_stride_A, lda);
+      }
+    }
+    // outputChk_row_major(host_A, batch_count, lda, batch_stride_A,  options.problem_size.m(), k);
+
+    for (int b_idx = 0; b_idx < batch_count; b_idx++) {
+      for (int col_idx = 0; col_idx < options.problem_size.n(); col_idx++) {
+        for (int row_idx = 0; row_idx < k; row_idx++) {
+          // n = n, k = k, ldb = k * batch_count, 
+          // host_B[row_idx + col_idx * ldb + b_idx * k] = static_cast<float>(((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange);
+
+          // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>(((options.problem_size.n() + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange) / DIV);
+          host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(static_cast<float>((row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()) % kRange) / DIV);
+          // host_B[row_idx + col_idx * ldb + b_idx * ldb * options.problem_size.n()] = static_cast<ElementInputB>(1.f);
+        }
+      }
     }
   }
-  // outputChk(host_B, batch_count, ldb, batch_stride_B, k, options.problem_size.n());
 
   // fill C
   for (int b_idx = 0; b_idx < batch_count; b_idx++) {
     for (int col_idx = 0; col_idx < options.problem_size.n(); col_idx++) {
-      for (int row_idx = 0; row_idx < m; row_idx++) {
+      for (int row_idx = 0; row_idx < options.problem_size.m(); row_idx++) {
         host_C[row_idx + col_idx * ldc + b_idx * ldc * options.problem_size.n()] = static_cast<ElementOutput>(0.f);
       }
     }
@@ -662,8 +784,9 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
     return result;
   }
 
-  int const n = (options.if_split_phase == 1 || options.if_split_phase == 0) ? (options.problem_size.n() - 2 * options.partition) : options.problem_size.n();
-  // int const n = (options.if_split_phase == 1 || options.if_split_phase == 0) ? (options.problem_size.n() - 16) : options.problem_size.n();
+  // int const n = (options.if_split_phase == 1 || options.if_split_phase == 0) ? (options.problem_size.n() - 2 * options.partition) : options.problem_size.n();
+  int const n = ((options.chksum_mode == 1) && (options.if_split_phase == 1 || options.if_split_phase == 0)) ? (options.problem_size.n() - options.padding) : options.problem_size.n();
+  int const m = ((options.chksum_mode == 0) && (options.if_split_phase == 1 || options.if_split_phase == 0)) ? (options.problem_size.m() - options.padding) : options.problem_size.m();
 
   // printf("cudablas, m: %d, n: %d, k: %d, lda: %d, ldb: %d, ldc: %d \n", m, n, k, lda, ldb, ldc);
 
@@ -671,7 +794,7 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
   for(int i = 0; i < options.iterations; i++){
     result = cutlass_strided_batched_sgemm(
       m, n, k, alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
-      beta, batch_count, options.if_split_phase, options.partition, options.monitored);
+      beta, batch_count, options.if_split_phase, options.partition, options.monitored, options.chksum_mode);
     if (result != cudaSuccess){
       std::cerr << "cutlass result = " << result << std::endl;
       return result;
@@ -690,10 +813,16 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
 
   //compare with reference code
   if(options.validation == 1){
-    result = strided_batched_gemm_nn_reference(m, options.problem_size.n(), k, alpha, ref_A, lda, batch_stride_A, ref_B, ldb, batch_stride_B, ref_C, ldc, batch_stride_C,
-      beta, batch_count);
+    bool res = false;
+    if (options.chksum_mode == 1) {
+      result = strided_batched_gemm_nn_reference(m, options.problem_size.n(), k, alpha, ref_A, lda, batch_stride_A, ref_B, ldb, batch_stride_B, ref_C, ldc, batch_stride_C, beta, batch_count);
+      res = valid(m, options.problem_size.n(), k, result_C, ref_C, ldc, batch_stride_C, batch_count);
+    }
+    else{
+      result = strided_batched_gemm_nn_reference(options.problem_size.m(), n, k, alpha, ref_A, lda, batch_stride_A, ref_B, ldb, batch_stride_B, ref_C, ldc, batch_stride_C, beta, batch_count);
+      res = valid(options.problem_size.m(), n, k, result_C, ref_C, ldc, batch_stride_C, batch_count);
+    }
 
-    bool res = valid(m, options.problem_size.n(), k, result_C, ref_C, ldc, batch_stride_C, batch_count);
     if(res){
       printf("self-validate not error\n");
     }
@@ -745,8 +874,8 @@ int main(int argc, const char **argv) {
     options.print_usage(std::cout) << std::endl;
     return 0;
   }
-    
-  printf("%d x %d x %d x %d BF16 tensor op Non-Transposed Matrix Multiply\n", \
+
+  printf("%d x %d x %d x %d BF16 tensor op Transposed Matrix Multiply\n", \
     options.batch_count, options.problem_size.m(), options.problem_size.n(), options.problem_size.k());
 
   cudaError_t result = cudaSuccess;

@@ -72,8 +72,6 @@ done
 
 # ./out_c.exe --m=4096 --n=8192 --k=4096 --split=0 --iterations=1
 
-# srun --account=cdux --partition=chen --time=150 --nodes=1 --ntasks=1 --cpus-per-task=16 --mem=100G --gpus=1 --pty bash
-
 # conda install conda-forge::numactl-devel-conda-x86_64
 
 # ./boutT.exe --m=1024 --n=1024 --k=128 --batch=256 --split=1 --iterations=1 --validate=1

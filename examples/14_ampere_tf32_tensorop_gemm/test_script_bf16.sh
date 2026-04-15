@@ -2,14 +2,14 @@
 
 Prepare(){
     echo "----------Compling for BF16 Testing-----------"
-    nvcc ampere_bf16_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o outT_c_bf16.exe
-    nvcc ampere_bf16_tensorop_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_80 -std=c++17 -o outT_baseline_bf16.exe
+    nvcc ampere_bf16_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o outT_c_bf16.exe
+    nvcc ampere_bf16_tensorop_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_90 -std=c++17 -o outT_baseline_bf16.exe
 
-    nvcc ampere_bf16_batched_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o boutT_bf16.exe
-    nvcc ampere_bf16_batched_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -std=c++17 -arch=sm_80 -o bloutT_bf16.exe
+    nvcc ampere_bf16_batched_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o boutT_bf16.exe
+    nvcc ampere_bf16_batched_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -std=c++17 -arch=sm_90 -o bloutT_bf16.exe
 
-    nvcc ampere_bf16_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o bout_bf16.exe
-    nvcc ampere_bf16_batched_gemm_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_80 -std=c++17 -o blout_bf16.exe
+    nvcc ampere_bf16_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o bout_bf16.exe
+    nvcc ampere_bf16_batched_gemm_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_90 -std=c++17 -o blout_bf16.exe
 }
 
 test_Transposed_GEMM_BF16(){

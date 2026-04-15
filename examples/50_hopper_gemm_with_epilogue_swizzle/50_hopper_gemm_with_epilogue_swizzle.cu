@@ -53,6 +53,9 @@
     Please refer to examples 48, 49 to learn more about kernel schedules and other CuTe examples
     present in `test/unit/cute` to famialiarize with the basics of CuTe.
 
+    nvcc 50_hopper_gemm_with_epilogue_swizzle.cu -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90a -D__CUDA_ARCH_FEAT_SM90_ALL --expt-relaxed-constexpr -std=c++17 -o cutlass_test.exe 
+
+
     Examples:
 
       $ ./examples/50_hopper_gemm_with_epilogue_swizzle/50_hopper_gemm_with_epilogue_swizzle

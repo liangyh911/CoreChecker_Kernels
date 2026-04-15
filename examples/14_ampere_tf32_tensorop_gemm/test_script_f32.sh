@@ -2,14 +2,14 @@
 
 Prepare(){
     echo "----------Compling for F32 Testing-----------"
-    nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o outT_c_f32.exe
-    nvcc ampere_tf32_tensorop_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_80 -std=c++17 -o outT_baseline_f32.exe
+    nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o outT_c_f32.exe
+    nvcc ampere_tf32_tensorop_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_90 -std=c++17 -o outT_baseline_f32.exe
 
-    nvcc ampere_tf32_batched_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o boutT_f32.exe
-    nvcc ampere_tf32_batched_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -std=c++17 -arch=sm_80 -o bloutT_f32.exe
+    nvcc ampere_tf32_batched_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o boutT_f32.exe
+    nvcc ampere_tf32_batched_gemm_T_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -std=c++17 -arch=sm_90 -o bloutT_f32.exe
 
-    nvcc ampere_tf32_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -std=c++17 -o bout_f32.exe
-    nvcc ampere_tf32_batched_gemm_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_80 -std=c++17 -o blout_f32.exe
+    nvcc ampere_tf32_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o bout_f32.exe
+    nvcc ampere_tf32_batched_gemm_baseline.cu -O0 -I$HOME/cutlass/origin_cutlass/include -I$HOME/cutlass/origin_cutlass/tools/util/include -I$HOME/cutlass/origin_cutlass/examples/common -arch=sm_90 -std=c++17 -o blout_f32.exe
 }
 
 test_Transposed_GEMM_BF16(){
