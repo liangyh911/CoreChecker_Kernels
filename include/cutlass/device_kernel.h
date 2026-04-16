@@ -99,11 +99,11 @@ void Kernel(typename Operator::Params params) {
   cutlass::arch::synclog_print();
 }
 
-/// Generic CUTLASS kernel template of Batched GEMM.
+/// Generic CUTLASS kernel template.
 template <typename Operator>
 CUTLASS_GLOBAL
-void Kernel_Batched(typename Operator::Params params, 
-            int if_split_phase, int *SM_check_res, int partion, int matrix_SM, int monitored_batched_count
+void Kernel_Batched_v1(typename Operator::Params params, 
+            int if_split_phase, int *SM_check_res, int partion
             // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking
           ) {  
   // Dynamic shared memory base pointer
@@ -114,7 +114,31 @@ void Kernel_Batched(typename Operator::Params params,
 
   Operator op;
 
-  op(params, *shared_storage, if_split_phase, SM_check_res, partion, matrix_SM, monitored_batched_count
+  op(params, *shared_storage, if_split_phase, SM_check_res, partion
+    // all_start, compute, finding, recompute, compare, checking
+  );
+  
+  cutlass::arch::synclog_print();
+}
+
+/// Generic CUTLASS kernel template of Batched GEMM.
+template <typename Operator>
+CUTLASS_GLOBAL
+void Kernel_Batched(typename Operator::Params params, 
+            int if_split_phase, int *SM_check_res, int matrix_SM, int batch_per_TB, int monitored_batched_count,
+            bool injection, int faulty_smid, int *faulty_MMAs, int *faulty_elements, int faulty_bit
+            // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking
+          ) {  
+  // Dynamic shared memory base pointer
+  extern __shared__ int SharedStorageBase[];
+  // Declare pointer to dynamic shared memory.
+  typename Operator::SharedStorage *shared_storage =
+      reinterpret_cast<typename Operator::SharedStorage *>(SharedStorageBase);
+
+  Operator op;
+
+  op(params, *shared_storage, if_split_phase, SM_check_res, matrix_SM, batch_per_TB, monitored_batched_count,
+     injection, faulty_smid, faulty_MMAs, faulty_elements, faulty_bit
     // all_start, compute, finding, recompute, compare, checking
   );
   

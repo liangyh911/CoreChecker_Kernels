@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief Template for a pipelined GEMM kernel. Does not compute batching or support split-K.
+    \brief Template for a pipelined batch GEMM kernel.
 */
 
 #pragma once
@@ -40,20 +40,10 @@
 #include "cutlass/device_kernel.h"
 
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
-#include "cutlass/gemm/kernel/gemm.h"
+#include "cutlass/gemm/kernel/gemm_batched_v1.h"
 
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/device/default_gemm_configuration.h"
-
-#include "cutlass/layout/permute.h"
-
-#include "cutlass/gemm_ring_queue.h"
-#include <cmath>
-
-#include <string>
-#include <fstream>
-#include <filesystem>
-namespace fs = std::filesystem;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -61,7 +51,7 @@ namespace cutlass {
 namespace gemm {
 namespace device {
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
 /*! Gemm device-level operator. This is an interface to efficient CUTLASS GEMM kernels that may
   be invoked from host code.
@@ -175,14 +165,7 @@ namespace device {
     class Gemm;
 */
 
-// __device__ uint8_t *Signature_Array;
-// __device__ int *Lock_Signature;
-// __device__ RingQueue_v2 *d_queues;
-// __device__ int *d_buffer, *d_head, *d_tail;
-
-__device__ int *SM_check_res;
-__device__ int *d_all_start, *d_compute, *d_finding, * d_recompute, *d_compare, *d_checking, *d_SM_JOBS, *d_all_start_for_split;
-// __device__ uint8_t *ChkSum_Signature_A_Col;
+// __device__ int *SM_check_res;
 
 template <
     /// Element type for A matrix operand
@@ -220,8 +203,7 @@ template <
         OperatorClass_, ArchTag_, ElementA_, ElementB_, ElementC_,
         ElementAccumulator_>::EpilogueOutputOp,
     /// Threadblock-level swizzling operator
-    typename ThreadblockSwizzle_ =
-        typename threadblock::GemmIdentityThreadblockSwizzle<>,
+    typename ThreadblockSwizzle_ = threadblock::GemmBatchedIdentityThreadblockSwizzle,
     /// Number of stages used in the pipelined mainloop
     int Stages =
         DefaultGemmConfiguration<OperatorClass_, ArchTag_, ElementA_, ElementB_,
@@ -234,21 +216,12 @@ template <
     int AlignmentB =
         DefaultGemmConfiguration<OperatorClass_, ArchTag_, ElementA_, ElementB_,
                                  ElementC_, ElementAccumulator_>::kAlignmentB,
-    /// If true, kernel supports split-K with serial reduction
-    bool SplitKSerial = false,
     /// Operation performed by GEMM
     typename Operator_ = typename DefaultGemmConfiguration<
         OperatorClass_, ArchTag_, ElementA_, ElementB_, ElementC_,
-        ElementAccumulator_>::Operator,
-    /// Gather operand A by using an index array
-    bool GatherA = false,
-    /// Gather operand B by using an index array
-    bool GatherB = false,
-    /// Scatter result D by using an index array
-    bool ScatterD = false,
-    /// Permute result D
-    typename PermuteDLayout = layout::NoPermute>
-class Gemm {
+        ElementAccumulator_>::Operator
+>
+class GemmBatchedV1 {
  public:
 
   using ElementA = ElementA_;
@@ -269,17 +242,14 @@ class Gemm {
   using InstructionShape = InstructionShape_;
   using EpilogueOutputOp = EpilogueOutputOp_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
-  using Operator = Operator_;
   static int const kStages = Stages;
   static int const kAlignmentA = AlignmentA;
   static int const kAlignmentB = AlignmentB;
   static int const kAlignmentC = EpilogueOutputOp::kCount;
-  static bool const kSplitKSerial = SplitKSerial;
-  static ComplexTransform const kTransformA = ComplexTransform::kNone;
-  static ComplexTransform const kTransformB = ComplexTransform::kNone;
+  using Operator = Operator_;
 
   /// Define the kernel
-  using GemmKernel = typename kernel::DefaultGemm<
+  using DefaultGemmKernel = typename kernel::DefaultGemm<
     ElementA,
     LayoutA,
     kAlignmentA,
@@ -297,14 +267,11 @@ class Gemm {
     EpilogueOutputOp,
     ThreadblockSwizzle,
     kStages,
-    kSplitKSerial,
-    Operator,
-    SharedMemoryClearOption::kNone,
-    GatherA,
-    GatherB,
-    ScatterD,
-    PermuteDLayout
+    false,
+    Operator
   >::GemmKernel;
+
+  using GemmKernel = kernel::GemmBatchedV1<typename DefaultGemmKernel::Mma, typename DefaultGemmKernel::Epilogue, ThreadblockSwizzle>;
 
   /// Argument structure
   struct Arguments {
@@ -315,15 +282,15 @@ class Gemm {
 
     GemmCoord problem_size;
     TensorRef<ElementA const, LayoutA> ref_A;
+    int64_t stride_A;
     TensorRef<ElementB const, LayoutB> ref_B;
+    int64_t stride_B;
     TensorRef<ElementC const, LayoutC> ref_C;
+    int64_t stride_C;
     TensorRef<ElementC, LayoutC> ref_D;
+    int64_t stride_D;
     typename EpilogueOutputOp::Params epilogue;
-    int split_k_slices;
-    // For gather+scatter operations
-    int const *gather_A_indices;
-    int const *gather_B_indices;
-    int const *scatter_D_indices;
+    int batch_count;
 
     //
     // Methods
@@ -331,37 +298,34 @@ class Gemm {
 
     /// Default ctor
     CUTLASS_HOST_DEVICE
-    Arguments(): problem_size(0, 0, 0), split_k_slices(1) {
-
-    }
+    Arguments() { }
 
     /// Constructs an Arguments structure 
     CUTLASS_HOST_DEVICE
     Arguments(
       GemmCoord problem_size_,
       TensorRef<ElementA const, LayoutA> ref_A_,
+      int64_t stride_A_,
       TensorRef<ElementB const, LayoutB> ref_B_,
+      int64_t stride_B_,
       TensorRef<ElementC const, LayoutC> ref_C_,
+      int64_t stride_C_,
       TensorRef<ElementC, LayoutC> ref_D_,
-      typename EpilogueOutputOp::Params epilogue_ = 
-        typename EpilogueOutputOp::Params(),
-      int split_k_slices = 1,
-      int const *gather_A_indices_ = nullptr,
-      int const *gather_B_indices_ = nullptr,
-      int const *scatter_D_indices_ = nullptr
+      int64_t stride_D_,
+      typename EpilogueOutputOp::Params epilogue_,
+      int batch_count_
     ):
       problem_size(problem_size_),
       ref_A(ref_A_),
+      stride_A(stride_A_),
       ref_B(ref_B_),
+      stride_B(stride_B_),
       ref_C(ref_C_),
+      stride_C(stride_C_),
       ref_D(ref_D_),
+      stride_D(stride_D_),
       epilogue(epilogue_),
-      split_k_slices(split_k_slices),
-      gather_A_indices(gather_A_indices_),
-      gather_B_indices(gather_B_indices_),
-      scatter_D_indices(scatter_D_indices_) {
-
-    }
+      batch_count(batch_count_) { }
   };
 
 private:
@@ -372,25 +336,25 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmBatchedV1() { }
 
   /// Determines whether the GEMM can execute the given problem.
   static Status can_implement(Arguments const &args) {
 
-    if (!kSplitKSerial && args.split_k_slices > 1) {
-      return Status::kErrorInvalidProblem;
+    if (!TensorRef_aligned(args.ref_A, kAlignmentA) || (args.stride_A % kAlignmentA)) {
+      return Status::kErrorMisalignedOperand;
     }
 
-    Status status = GemmKernel::can_implement(
-      args.problem_size,
-      args.ref_A.non_const_ref(),
-      args.ref_B.non_const_ref(),
-      args.ref_C.non_const_ref(),
-      args.ref_D
-    );
+    if (!TensorRef_aligned(args.ref_B, kAlignmentB) || (args.stride_B % kAlignmentB)) {
+      return Status::kErrorMisalignedOperand;
+    }
 
-    if (status != Status::kSuccess) {
-      return status;
+    if (!TensorRef_aligned(args.ref_C, kAlignmentC) || (args.stride_C % kAlignmentC)) {
+      return Status::kErrorMisalignedOperand;
+    }
+
+    if (!TensorRef_aligned(args.ref_D, kAlignmentC) || (args.stride_D % kAlignmentC)) {
+      return Status::kErrorMisalignedOperand;
     }
 
     return Status::kSuccess;
@@ -398,23 +362,7 @@ public:
 
   /// Gets the workspace size
   static size_t get_workspace_size(Arguments const &args) {
-    
-    size_t bytes = 0;
-
-    // Determine grid shape
-    ThreadblockSwizzle threadblock_swizzle;
-
-    cutlass::gemm::GemmCoord tiled_shape = threadblock_swizzle.get_tiled_shape(
-      args.problem_size, 
-      {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
-      args.split_k_slices);
-    
-    if (kSplitKSerial && args.split_k_slices > 1) {
-
-      bytes += sizeof(int) * size_t(tiled_shape.m()) * size_t(tiled_shape.n());
-    }
-
-    return bytes;
+    return 0;
   }
 
   /// Initializes GEMM state from arguments.
@@ -424,47 +372,24 @@ public:
     ThreadblockSwizzle threadblock_swizzle;
 
     cutlass::gemm::GemmCoord grid_shape = threadblock_swizzle.get_tiled_shape(
-      args.problem_size, 
+      args.problem_size,
       {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
-      args.split_k_slices);
-
-    if (kSplitKSerial) {
-      if (args.split_k_slices > 1) {
-        if (!workspace) {
-          return Status::kErrorWorkspaceNull;
-        }
-
-        size_t bytes = get_workspace_size(args);
-      
-        cudaError_t result = cudaMemsetAsync(workspace, 0, bytes, stream);
-
-        if (result != cudaSuccess) {
-          return Status::kErrorInternal;
-        }
-      }
-    }
-    else {
-
-      if (args.split_k_slices > 1) {
-        return Status::kErrorInvalidProblem;
-      }
-    }
-
-    // printf("Row: stride A: %d, stride B: %d, stride C: %d\n", args.ref_A.stride(0), args.ref_B.stride(0), args.ref_C.stride(0));
+      args.batch_count);
 
     // Initialize the Params structure
     params_ = typename GemmKernel::Params{
       args.problem_size,
       grid_shape,
       args.ref_A.non_const_ref(),
+      args.stride_A,
       args.ref_B.non_const_ref(),
+      args.stride_B,
       args.ref_C.non_const_ref(),
+      args.stride_C,
       args.ref_D,
+      args.stride_D,
       args.epilogue,
-      static_cast<int *>(workspace),
-      args.gather_A_indices,
-      args.gather_B_indices,
-      args.scatter_D_indices
+      args.batch_count
     };
 
     return Status::kSuccess;
@@ -472,39 +397,46 @@ public:
 
   /// Lightweight update given a subset of arguments
   Status update(Arguments const &args, void *workspace = nullptr) {
-    
-    if (kSplitKSerial && args.split_k_slices > 1) {  
-      if (!workspace) {
-        return Status::kErrorWorkspaceNull;
-      }
-    }
 
     params_.ref_A.reset(args.ref_A.non_const_ref().data());
     params_.ref_B.reset(args.ref_B.non_const_ref().data());
     params_.ref_C.reset(args.ref_C.non_const_ref().data());
-    params_.ref_D.reset(args.ref_D.data());
-    params_.output_op = args.epilogue;
-    params_.semaphore = static_cast<int *>(workspace);
+    params_.ref_D.reset(args.ref_D.data()); 
 
     return Status::kSuccess;
   }
 
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-              // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-              cudaStream_t stream = nullptr) {
+  Status run(int if_split_phase, int partion, float *t_compute, cudaStream_t stream = nullptr) {
 
     ThreadblockSwizzle threadblock_swizzle;
 
     dim3 grid = threadblock_swizzle.get_grid_shape(params_.grid_tiled_shape);
     dim3 block(GemmKernel::kThreadCount, 1, 1);
+    dim3 new_grid(12, 11, 1);
+
+    bool deBug = true;
+    int iterations = 500;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    // float t_compute = 0;
+
+    int *SM_check_res;
+    cudaMalloc((void**)&SM_check_res, 132 * sizeof(int));
+    cudaMemset(SM_check_res, 0, 132 * sizeof(int));
+
+    // printf("Grdi: (%d, %d, %d); Blocks: (%d, %d, %d)\n", new_grid.x, new_grid.y, new_grid.z, block.x, block.y, block.z);
+
+    // printf("(%d, %d, %d), %d\n", grid.x, grid.y, grid.z, block.x);
 
     cudaError_t result;
 
     int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
 
+    // printf("share memory size: %d\n", smem_size);
     if (smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(Kernel_GEMM<GemmKernel>,
+      result = cudaFuncSetAttribute(Kernel_Batched_v1<GemmKernel>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     smem_size);
 
@@ -513,228 +445,49 @@ public:
       }
     }
 
-    // Fault Injection Info
-    char flag;
-    bool injection = false;
-    // int faulty_smid = -1, faulty_tid_1 = -1, faulty_tid_2 = -1, faulty_bit = -1;
-
-    int faulty_smid = -1, faulty_bit = -1, *h_faulty_MMAs, *d_faulty_MMAs, *h_faulty_elements, *d_faulty_elements;
-    size_t faulty_size = sizeof(int) * 64;
-
-    h_faulty_MMAs = (int*)malloc(faulty_size);
-    h_faulty_elements = (int*)malloc(faulty_size);
-    cudaMalloc((void**)&d_faulty_MMAs, faulty_size);
-    cudaMemset(d_faulty_MMAs, -1, faulty_size);
-    cudaMalloc((void**)&d_faulty_elements, faulty_size);
-    cudaMemset(d_faulty_elements, -1, faulty_size);
-
-    int gpu_dev = -1;
-    cudaGetDevice(&gpu_dev);
-
-    // get sm count 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, gpu_dev);
-    int num_sms = prop.multiProcessorCount;
-
-    // fs::path FIInfoPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "fi_info.bin";
-    fs::path destinationFile = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "FI.txt";
-
-    std::ifstream FIFile(destinationFile);
-    if(FIFile.is_open()){
-      FIFile.get(flag);
-      if(flag == 't'){
-        injection = true;
-        // printf("Perform Fault Injection.\n");
-        // Relative Path
-        fs::path planPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "plan.txt";
-        std::ifstream planFile(planPath);
-        if(planFile.is_open()){
-          std::string line;
-          // while (std::getline(planFile, line)) {
-            
-          if (!std::getline(planFile, line)) {
-              std::cerr << "File is empty" << std::endl;
-              return Status::kErrorInternal;
-          }
-
-          std::stringstream ss(line);
-          std::string token;
-          std::vector<int> nums;
-
-          while (std::getline(ss, token, ' ')) {
-              nums.push_back(std::stoi(token));
-          }
-
-          if (nums.size() != 129) {
-              printf("Error: expected 129 numbers but got %ld\n", nums.size());
-              return Status::kErrorInternal;
-          }
-
-          int idx = 0;
-          faulty_smid = nums[idx++];
-          faulty_smid = faulty_smid % num_sms;
-          // printf("faulty SM: %d, faulty MMA: ", faulty_smid);
-
-          for (int i = 0; i < 64; i++){
-            h_faulty_MMAs[i] = nums[idx++];
-            // printf("%d ", h_faulty_MMAs[i]);
-          }
-
-          // printf("faulty elements: ");
-          for (int i = 0; i < 64; i++){
-            h_faulty_elements[i] = nums[idx++];
-            // printf("%d ", h_faulty_elements[i]);
-          }
-          // printf("\n");
-              
-          // }
-
-          cudaMemcpy(d_faulty_MMAs, h_faulty_MMAs, faulty_size, cudaMemcpyHostToDevice);
-          cudaMemcpy(d_faulty_elements, h_faulty_elements, faulty_size, cudaMemcpyHostToDevice);
-        }
-        else{
-          printf("plan: Cannot open file, using default setting.\n");
-        }
-        planFile.close();
-
-        // read faulty bit
-        // std::ifstream bitFile("/home/yuhangl/control/bit.txt");
-        // Absolute Path
-        // fs::path bitPath = fs::path("/home/yuhangl") / ("control_" + std::to_string(gpu_dev)) / "bit.txt";
-        // Relative Path
-        fs::path bitPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "bit.txt";
-        std::ifstream bitFile(bitPath);
-        if(bitFile.is_open()){
-          if (bitFile >> faulty_bit) {
-              // std::cout << "faulty_bit = " << faulty_bit << std::endl;
-          }
-        }
-        else{
-          printf("bit: Cannot open file, using default setting.\n");
-        }
-        bitFile.close();
-      }
-      // std::cout << "faulty_smid = " << faulty_smid << ", faulty_tid = " << faulty_tid << " " << "faulty_bit = " << faulty_bit << std::endl;
-    }
-    else{
-      printf("FI: Cannot open file, using default setting.\n");
-    }
-    FIFile.close();
-
-    // printf("smem_size: %d\n", smem_size);
-
-    // 0-no split; 1-split; 2-only abft
-    // int if_split_phase = 0;
-
-    // printf("m: %d, n: %d, k: %d, log: %d\n", params_.problem_size.m(), params_.problem_size.n(), params_.problem_size.k(), params_.swizzle_log_tile);
-    // std::cout << std::is_same<LayoutA_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutB_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutC_, cutlass::layout::RowMajor>::value <<std::endl;
-
-    // // unsigned int nsmid;
-    // cudaDeviceProp prop;
-    // cudaGetDeviceProperties(&prop, 0);
-    // int num_sms = prop.multiProcessorCount;
-
-    // printf("SM count: %d\n", num_sms);
-
-    cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
-    cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
-
-    // bool deBug = !injection;
-    int iterations = injection ? 0 : 500;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    *t_compute = 0;
-    // dim3 new_block(64,1,1);
-    // dim3 new_grid(12,11,1);
-    dim3 new_grid(num_sms, 1, 1);
-
-    // void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion
-    //             // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    //           };
-
-    void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion, &SchTCC_mode, &injection,
-                &faulty_smid, &d_faulty_MMAs, &d_faulty_elements, &faulty_bit
-                // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    };
-
+    void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion};
 
     cutlass::arch::synclog_setup();
 
-    // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-    //                                                                 Lock_Signature, final_sum, if_split_phase, 
-    //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-    //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
+    cudaLaunchCooperativeKernel((void*)cutlass::Kernel_Batched_v1<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
+    // cutlass::Kernel_Batched<GemmKernel><<<new_grid, block, smem_size, stream>>>(params_);
 
-    cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
-    
-    // Grdi: (4, 3, 1); Blocks: (128, 1, 1) when (386, 384, 384)
-    // printf("Grdi: (%d, %d, %d); Blocks: (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y, block.z);
     cudaDeviceSynchronize();
-    if(!injection){
+    if(deBug){
       cudaEventRecord(start, stream);
     }
+
     for(int i = 0; i < iterations; i++){
-      // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-      //                                                                 Lock_Signature, final_sum, if_split_phase, 
-      //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-      //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
-      
-      cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
+      cudaLaunchCooperativeKernel((void*)cutlass::Kernel_Batched_v1<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
     }
-    if(!injection){
+
+    if(deBug){
       cudaEventRecord(stop, stream);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(t_compute, start, stop);
-      // printf("compute kernel time: %f\n", (*t_compute)/iterations);
-    }
-    result = cudaGetLastError();
 
-    cudaDeviceSynchronize();
-    
-    // // copy back SM check results
-    if(injection){
-      int *h_SM_check_res;
-      h_SM_check_res = (int*)malloc(num_sms * sizeof(int));
-      cudaMemcpy(h_SM_check_res, SM_check_res, num_sms*sizeof(int), cudaMemcpyDeviceToHost);
-      // record checking results
-      // int gpu_dev = -1;
-      // cudaGetDevice(&gpu_dev);
-      // char *job_id = getenv("SLURM_JOB_ID");
-      fs::path SMCheckResPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
-      std::ofstream ofs(SMCheckResPath, std::ios::out | std::ios::app);
-      // ofs.write(reinterpret_cast<const char*>(h_SM_check_res), sizeof(int) * num_sms);
-      for (int i = 0; i < num_sms; i++) {
-          ofs << h_SM_check_res[i];
-          if (i != num_sms - 1)
-              ofs << " ";
-      }
-      ofs << "\n";
-      free(h_SM_check_res);
+      printf("compute kernel time: %f\n", (*t_compute)/iterations);
     }
 
     cudaFree(SM_check_res);
 
-    cudaFree(d_faulty_MMAs);
-    cudaFree(d_faulty_elements);
-    free(h_faulty_MMAs);
-    free(h_faulty_elements);
+    result = cudaGetLastError();
 
     return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, stream);
+  Status operator()(cudaStream_t stream = nullptr) {
+    return run(stream);
   }
- 
+
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
     void *workspace = nullptr, 
     cudaStream_t stream = nullptr) {
     
-    Status status = initialize(args, workspace, stream);
+    Status status = initialize(args, workspace);
     
     if (status == Status::kSuccess) {
       status = run(stream);
@@ -748,58 +501,61 @@ public:
 
 /// Partial specialization for column-major output exchanges problem size and operand.
 template <
-    /// Element type for A matrix operand
-    typename ElementA_,
-    /// Layout type for A matrix operand
-    typename LayoutA_,
-    /// Element type for B matrix operand
-    typename ElementB_,
-    /// Layout type for B matrix operand
-    typename LayoutB_,
-    /// Element type for C and D matrix operands
-    typename ElementC_,
-    /// Element type for internal accumulation
-    typename ElementAccumulator_,
-    /// Operator class tag
-    typename OperatorClass_,
-    /// Tag indicating architecture to tune for
-    typename ArchTag_,
-    /// Threadblock-level tile size (concept: GemmShape)
-    typename ThreadblockShape_,
-    /// Warp-level tile size (concept: GemmShape)
-    typename WarpShape_,
-    /// Instruction-level tile size (concept: GemmShape)
-    typename InstructionShape_,
-    /// Epilogue output operator
-    typename EpilogueOutputOp_,
-    /// Threadblock-level swizzling operator
-    typename ThreadblockSwizzle_,
-    /// Number of stages used in the pipelined mainloop
-    int Stages,
-    /// Access granularity of A matrix in units of elements
-    int AlignmentA,
-    /// Access granularity of B matrix in units of elements
-    int AlignmentB,
-    /// If true, kernel supports split-K as a serial reduction
-    bool SplitKSerial,
-    /// Operation performed by GEMM
-    typename Operator_,
-    /// Gather operand A by using an index array
-    bool GatherA,
-    /// Gather operand B by using an index array
-    bool GatherB,
-    /// Scatter result D by using an index array
-    bool ScatterD,
-    /// Permute result D
-    typename PermuteDLayout
+  /// Element type for A matrix operand
+  typename ElementA_,
+  /// Layout type for A matrix operand
+  typename LayoutA_,
+  /// Element type for B matrix operand
+  typename ElementB_,
+  /// Layout type for B matrix operand
+  typename LayoutB_,
+  /// Element type for C and D matrix operands
+  typename ElementC_,
+  /// Element type for internal accumulation
+  typename ElementAccumulator_,
+  /// Operator class tag
+  typename OperatorClass_,
+  /// Tag indicating architecture to tune for
+  typename ArchTag_,
+  /// Threadblock-level tile size (concept: GemmShape)
+  typename ThreadblockShape_,
+  /// Warp-level tile size (concept: GemmShape)
+  typename WarpShape_,
+  /// Warp-level tile size (concept: GemmShape)
+  typename InstructionShape_,
+  /// Epilogue output operator
+  typename EpilogueOutputOp_,
+  /// Threadblock-level swizzling operator
+  typename ThreadblockSwizzle_,
+  /// Number of stages used in the pipelined mainloop
+  int Stages,
+  /// Access granularity of A matrix in units of elements
+  int AlignmentA,
+  /// Access granularity of B matrix in units of elements
+  int AlignmentB,
+  typename Operator_
 >
-class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
-           layout::ColumnMajor,  // partially specialized on LayoutC
-           ElementAccumulator_, OperatorClass_, ArchTag_, ThreadblockShape_,
-           WarpShape_, InstructionShape_, EpilogueOutputOp_,
-           ThreadblockSwizzle_, Stages, AlignmentA, AlignmentB, SplitKSerial,
-           Operator_, GatherA, GatherB, ScatterD, PermuteDLayout> {
- public:
+class GemmBatchedV1<
+  ElementA_,
+  LayoutA_,
+  ElementB_,
+  LayoutB_,
+  ElementC_,
+  layout::ColumnMajor,
+  ElementAccumulator_,
+  OperatorClass_,
+  ArchTag_,
+  ThreadblockShape_,
+  WarpShape_,
+  InstructionShape_,
+  EpilogueOutputOp_,
+  ThreadblockSwizzle_,
+  Stages,
+  AlignmentA,
+  AlignmentB,
+  Operator_
+> {
+public:
 
   using ElementA = ElementA_;
   using LayoutA = LayoutA_;
@@ -819,15 +575,15 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
   using InstructionShape = InstructionShape_;
   using EpilogueOutputOp = EpilogueOutputOp_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
-  using Operator = Operator_;
   static int const kStages = Stages;
+
   static int const kAlignmentA = AlignmentA;
   static int const kAlignmentB = AlignmentB;
-  static ComplexTransform const kTransformA = ComplexTransform::kNone;
-  static ComplexTransform const kTransformB = ComplexTransform::kNone;
-  static bool const kSplitKSerial = SplitKSerial;
+  static int const kAlignmentC = EpilogueOutputOp::kCount;
+  static bool const kSplitKSerial = false;
 
-  using UnderlyingOperator = Gemm< 
+  //
+  using UnderlyingOperator = GemmBatchedV1< 
     ElementB,
     typename layout::LayoutTranspose<LayoutB>::type,
     ElementA,
@@ -844,18 +600,11 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
     ThreadblockSwizzle,
     Stages,
     kAlignmentB,
-    kAlignmentA,
-    SplitKSerial,
-    Operator,
-    GatherB,
-    GatherA,
-    ScatterD,
-    PermuteDLayout
+    kAlignmentA
   >;
 
   using UnderlyingArguments = typename UnderlyingOperator::Arguments;
   using GemmKernel = typename UnderlyingOperator::GemmKernel;
-  static int const kAlignmentC = UnderlyingOperator::kAlignmentC;
 
   /// Argument structure
   struct Arguments {
@@ -866,15 +615,15 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
 
     GemmCoord problem_size;
     TensorRef<ElementA const, LayoutA> ref_A;
+    int64_t stride_A;
     TensorRef<ElementB const, LayoutB> ref_B;
+    int64_t stride_B;
     TensorRef<ElementC const, LayoutC> ref_C;
+    int64_t stride_C;
     TensorRef<ElementC, LayoutC> ref_D;
+    int64_t stride_D;
     typename EpilogueOutputOp::Params epilogue;
-    int split_k_slices;
-    // For gather+scatter operations
-    int *gather_A_indices;
-    int *gather_B_indices;
-    int *scatter_D_indices;
+    int batch_count;
 
     //
     // Methods
@@ -889,26 +638,27 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
     Arguments(
       GemmCoord problem_size_,
       TensorRef<ElementA const, LayoutA> ref_A_,
+      int64_t stride_A_,
       TensorRef<ElementB const, LayoutB> ref_B_,
+      int64_t stride_B_,
       TensorRef<ElementC const, LayoutC> ref_C_,
+      int64_t stride_C_,
       TensorRef<ElementC, LayoutC> ref_D_,
-      typename EpilogueOutputOp::Params epilogue_ = 
-        typename EpilogueOutputOp::Params(),
-      int split_k_slices = 1,
-      int *gather_A_indices_ = nullptr,
-      int *gather_B_indices_ = nullptr,
-      int *scatter_D_indices_ = nullptr
+      int64_t stride_D_,
+      typename EpilogueOutputOp::Params epilogue_,
+      int batch_count_
     ):
       problem_size(problem_size_),
       ref_A(ref_A_),
+      stride_A(stride_A_),
       ref_B(ref_B_),
+      stride_B(stride_B_),
       ref_C(ref_C_),
+      stride_C(stride_C_),
       ref_D(ref_D_),
+      stride_D(stride_D_),
       epilogue(epilogue_),
-      split_k_slices(split_k_slices),
-      gather_A_indices(gather_A_indices_),
-      gather_B_indices(gather_B_indices_),
-      scatter_D_indices(scatter_D_indices_) { }
+      batch_count(batch_count_) { }
   };
 
 private:
@@ -918,22 +668,22 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmBatchedV1() { }
 
   /// Helper to construct a transposed equivalent for the underying GEMM operator
   static UnderlyingArguments to_underlying_arguments(Arguments const &args) {
-    // printf("Col: stride A (ldA): %d, stride B (ldB): %d, stride C (ldC): %d\n", args.ref_A.stride(0), args.ref_B.stride(0), args.ref_C.stride(0));
     return UnderlyingArguments(
       {args.problem_size.n(), args.problem_size.m(), args.problem_size.k()},
       {args.ref_B.data(), args.ref_B.stride(0)},
+      args.stride_B,
       {args.ref_A.data(), args.ref_A.stride(0)},
+      args.stride_A,
       {args.ref_C.data(), args.ref_C.stride(0)},
+      args.stride_C,
       {args.ref_D.data(), args.ref_D.stride(0)},
+      args.stride_D,
       args.epilogue,
-      args.split_k_slices,
-      args.gather_B_indices,
-      args.gather_A_indices,
-      args.scatter_D_indices
+      args.batch_count
     );
   }
 
@@ -962,38 +712,31 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-            // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking, 
-            cudaStream_t stream = nullptr) {
-
-    return underlying_operator_.run(if_split_phase, partion, SchTCC_mode, t_compute,
-                                    // all_start, compute, finding, recompute, compare, checking, 
-                                    stream);
+  Status run(int if_split_phase, int partion, float *t_compute, cudaStream_t stream = nullptr) {
+    return underlying_operator_.run(if_split_phase, partion, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-                    // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-                    cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, SchTCC_mode, t_compute,
-                // all_start, compute, finding, recompute, compare, checking, 
-                stream);
+  Status operator()(cudaStream_t stream = nullptr) {
+    return run(stream);
   }
 
   /// Runs the kernel using initialized state.
   Status operator()(
-    Arguments const &args, 
+    Arguments const &args,
+    int if_split_phase, int partion, float *t_compute,
     void *workspace = nullptr, 
     cudaStream_t stream = nullptr) {
     
     Status status = initialize(args, workspace, stream);
     
     if (status == Status::kSuccess) {
-      status = run(stream);
+      status = run(if_split_phase, partion, t_compute, stream);
     }
 
     return status;
   }
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////

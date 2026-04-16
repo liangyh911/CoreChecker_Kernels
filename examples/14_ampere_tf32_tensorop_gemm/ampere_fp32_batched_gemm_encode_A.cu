@@ -109,9 +109,9 @@ nvcc ampere_bf16_batched_gemm.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/too
 
 nvcc ampere_bf16_batched_gemm.cu -O0 -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90 -o bloutT_bf16.exe
 
-nvcc ampere_bf16_batched_gemm_encode_A.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o bout_bf16_A.exe
+nvcc ampere_fp32_batched_gemm_encode_A.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o bout_fp32_A.exe
 
-./bout_bf16_A.exe --m=128 --n=1024 --k=1024 --batch=256 --split=1 --iterations=1 --validate=0 --eval_mode=0
+./bout_fp32_A.exe --m=128 --n=1024 --k=1024 --batch=256 --split=1 --iterations=1 --validate=0 --eval_mode=0
 
 ncu -f -o batchPipe --set full ./bout_bf16.exe --m=128 --n=1024 --k=1024 --batch=256 --split=1 --iterations=1 --validate=1
 */
@@ -261,13 +261,13 @@ struct Options {
 using ElementAccumulator = float;                   // <- data type of accumulator
 using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
 
-using ElementInputA = cutlass::bfloat16_t;                        // <- data type of elements in input matrix A
-using ElementInputB = cutlass::bfloat16_t;                        // <- data type of elements in input matrix B
-using ElementOutput = cutlass::bfloat16_t;                        // <- data type of elements in output matrix D
+// using ElementInputA = cutlass::bfloat16_t;                        // <- data type of elements in input matrix A
+// using ElementInputB = cutlass::bfloat16_t;                        // <- data type of elements in input matrix B
+// using ElementOutput = cutlass::bfloat16_t;                        // <- data type of elements in output matrix D
 
-// using ElementInputA = float;                        // <- data type of elements in input matrix A
-// using ElementInputB = float;                        // <- data type of elements in input matrix B
-// using ElementOutput = float;                        // <- data type of elements in output matrix D
+using ElementInputA = float;                        // <- data type of elements in input matrix A
+using ElementInputB = float;                        // <- data type of elements in input matrix B
+using ElementOutput = float;                        // <- data type of elements in output matrix D
 
 
 // The code section below describes matrix layout of input and output matrices. Column Major for
@@ -1095,7 +1095,7 @@ int main(int argc, const char **argv) {
     return 0;
   }
     
-  printf("%d x %d x %d x %d BF16 tensor op Non-Transposed Matrix Multiply\n", \
+  printf("%d x %d x %d x %d FP32 tensor op Non-Transposed Matrix Multiply\n", \
     options.batch_count, options.problem_size.m(), options.problem_size.n(), options.problem_size.k());
 
   cudaError_t result = cudaSuccess;

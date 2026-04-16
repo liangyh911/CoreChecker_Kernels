@@ -403,23 +403,23 @@ public:
     return Status::kSuccess;
   }
 
-  void recordTime(std::string FP, float time, bool DEBUG){
-    std::ofstream outFile(FP, std::ios::app);
-    if(!outFile){
-      std::cerr << "Failed to open the file for appending." << std::endl;
-      return;
-    }
-    outFile << time << std::endl;
-    // if(DEBUG) printf("Data appended to the file successfully.\n");
-  }
+  // void recordTime(std::string FP, float time, bool DEBUG){
+  //   std::ofstream outFile(FP, std::ios::app);
+  //   if(!outFile){
+  //     std::cerr << "Failed to open the file for appending." << std::endl;
+  //     return;
+  //   }
+  //   outFile << time << std::endl;
+  //   // if(DEBUG) printf("Data appended to the file successfully.\n");
+  // }
 
   /// Runs the kernel using initialized state.
-  Status run(bool DEBUG, cudaStream_t stream = nullptr) {
+  Status run(bool DEBUG, float *t_compute, cudaStream_t stream = nullptr) {
 
-    fs::path destinationFile, fullPath;
-    const char* homeDir = nullptr;
-    homeDir = getenv("HOME");
-    fs::path homePath(homeDir);
+    // fs::path destinationFile, fullPath;
+    // const char* homeDir = nullptr;
+    // homeDir = getenv("HOME");
+    // fs::path homePath(homeDir);
 
     char *job_id = getenv("SLURM_JOB_ID");
     int gpu_dev = -1;
@@ -456,16 +456,19 @@ public:
       cudaEventCreate(&stop);
       cudaEventRecord(start, stream);
     }
-    float t_compute = 0;
-  
-    cutlass::Kernel<GemmKernel><<<grid, block, smem_size, stream>>>(params_);
+    // float t_compute = 0;
 
+    for(int i = 0; i < 500; i++){
+      cutlass::Kernel<GemmKernel><<<grid, block, smem_size, stream>>>(params_);
+    }
+  
     if(DEBUG){
       cudaEventRecord(stop, stream);
       cudaEventSynchronize(stop);
-      cudaEventElapsedTime(&t_compute, start, stop);
-      destinationFile = fs::path("./control_" + std::string(job_id) + "/" + std::to_string(gpu_dev)) / "time/bgemm.txt";
-      recordTime(destinationFile, t_compute, true);
+      cudaEventElapsedTime(t_compute, start, stop);
+      // destinationFile = fs::path("./control_" + std::string(job_id) + "/" + std::to_string(gpu_dev)) / "time/bgemm.txt";
+      // recordTime(destinationFile, t_compute, true);
+      printf("baseline: compute time: %f\n", (*t_compute) / 500);
     }
 
     result = cudaGetLastError();
@@ -711,9 +714,9 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(bool DEBUG, cudaStream_t stream = nullptr) {
+  Status run(bool DEBUG, float *t_compute, cudaStream_t stream = nullptr) {
 
-    return underlying_operator_.run(DEBUG, stream);
+    return underlying_operator_.run(DEBUG, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.
@@ -724,14 +727,14 @@ public:
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
-    bool DEBUG, 
+    bool DEBUG, float *t_compute,
     void *workspace = nullptr, 
     cudaStream_t stream = nullptr) {
     
     Status status = initialize(args, workspace, stream);
     
     if (status == Status::kSuccess) {
-      status = run(DEBUG, stream);
+      status = run(DEBUG, t_compute, stream);
     }
 
     return status;

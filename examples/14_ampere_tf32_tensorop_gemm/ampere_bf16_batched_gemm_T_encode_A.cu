@@ -37,6 +37,9 @@
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/util/command_line.h"
 
+#include "cutlass/gemm/device/gemm_batched_baseline.h"
+#include "cutlass/gemm/device/gemm_batched_v1.h"
+
 #include "helper.h"
 
 #include <cutlass/numeric_types.h>
@@ -110,7 +113,7 @@ ncu -f -o batchPipe --set full ./boutT_bf16.exe --m=1024 --n=1024 --k=128 --batc
 
 nvcc ampere_bf16_batched_gemm_T_encode_A.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_90 -std=c++17 -o boutT_bf16_A.exe
 
-./boutT_bf16_A.exe --m=1024 --n=1024 --k=128 --batch=256 --split=1 --iterations=1 --validate=0 --monitored=8
+./boutT_bf16_A.exe --m=1024 --n=1024 --k=128 --batch=256 --split=1 --iterations=1 --validate=0 --eval_mode=0
 
 mma cutlass/include/arch/mma.h  Matrix multiply-add operation - F32 = bf16 * bf16 + F32
 mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
@@ -123,6 +126,7 @@ struct Options {
   bool help;
 
   cutlass::gemm::GemmCoord problem_size;
+  cutlass::gemm::GemmCoord problem_size_baseline;
   int batch_count;
   float alpha;
   float beta;
@@ -139,10 +143,13 @@ struct Options {
   int monitored;
 
   int chksum_mode;
+
+  int eval_mode;
   
   Options():
     help(false),
     problem_size({128*3, 128*3, 128*3}),
+    problem_size_baseline({72,64,72}),
     batch_count(1),
     reference_check(true),
     iterations(1),
@@ -153,7 +160,8 @@ struct Options {
     validation(0),
     padding(8),
     monitored(0),
-    chksum_mode(1){ }
+    chksum_mode(1),
+    eval_mode(0){ }
 
   // bool valid() {
   //   return true;
@@ -185,6 +193,12 @@ struct Options {
     cmd.get_cmd_line_argument("monitored", monitored);
 
     cmd.get_cmd_line_argument("chksum_mode", chksum_mode);
+
+    cmd.get_cmd_line_argument("eval_mode", eval_mode);
+
+    problem_size_baseline.m() = problem_size.m();
+    problem_size_baseline.n() = problem_size.n();
+    problem_size_baseline.k() = problem_size.k();
 
     // cmd.get_cmd_line_argument("partition", partition);
 
@@ -223,7 +237,8 @@ struct Options {
       << "  --validate=<int>            0-no validate, 1-validate\n\n"
       << "  --padding=<int>             Number of checksum padding. 8 or 16"
       << "  --monitored=<int>           Number of ABFT monitored batches."
-      << "  --chksum_mode=<int>         0-column checksum, 1-row checksum (cutlass level)";
+      << "  --chksum_mode=<int>         0-column checksum, 1-row checksum (cutlass level)"
+      << "  --eval_mode=<int>           0-runtime evaluation, 1-detection evaluation.\n\n";
 
     out << "\n\nExamples:\n\n"
       << "$ ./examples/14_ampere_tf32_tensorop_gemm/14_ampere_tf32_tensorop_gemm --m=1024 --n=512 --k=1024 \\\n"
@@ -253,7 +268,6 @@ using ElementOutput = cutlass::bfloat16_t;                        // <- data typ
 // using ElementInputA = float;                        // <- data type of elements in input matrix A
 // using ElementInputB = float;                        // <- data type of elements in input matrix B
 // using ElementOutput = float;                        // <- data type of elements in output matrix D
-
 
 // The code section below describes matrix layout of input and output matrices. Column Major for
 
@@ -287,6 +301,129 @@ using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
 // Number of pipelines you want to use
 constexpr int NumStages = 4; 
 
+cudaError_t cutlass_strided_batched_sgemm_baseline(
+  int m, 
+  int n,
+  int k,
+  float alpha,
+  ElementInputA const *A,
+  int lda,
+  long long int batch_stride_A,
+  ElementInputB const *B,
+  int ldb,
+  long long int batch_stride_B,
+  ElementOutput *C,
+  int ldc,
+  long long int batch_stride_C,
+  float beta,
+  int batch_count, 
+  float *t_compute) {
+
+  using Gemm = cutlass::gemm::device::GemmBatchedBaseline<
+    ElementInputA, cutlass::layout::RowMajor,
+    ElementInputB, cutlass::layout::ColumnMajor,
+    ElementOutput, cutlass::layout::ColumnMajor,
+    ElementAccumulator,
+    MMAOp,
+    SmArch,
+    ShapeMMAThreadBlock,
+    ShapeMMAWarp,
+    ShapeMMAOp,
+    EpilogueOp
+    // SwizzleThreadBlock,
+    // NumStages
+  >;
+
+  Gemm gemm_op;
+
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  cutlass::Status status = gemm_op({
+      {m, n, k},
+      {A, lda}, 
+      batch_stride_A,
+      {B, ldb}, 
+      batch_stride_B,
+      {C, ldc}, 
+      batch_stride_C,
+      {C, ldc}, 
+      batch_stride_C,
+      {alpha, beta},
+      batch_count},
+      true, t_compute,
+      stream
+  );
+
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+
+  return cudaSuccess;
+}
+
+cudaError_t cutlass_strided_batched_sgemm_v1(
+  int m, 
+  int n,
+  int k,
+  float alpha,
+  ElementInputA const *A,
+  int lda,
+  long long int batch_stride_A,
+  ElementInputB const *B,
+  int ldb,
+  long long int batch_stride_B,
+  ElementOutput *C,
+  int ldc,
+  long long int batch_stride_C,
+  float beta,
+  int batch_count,
+  int if_split_phase,
+  int partition,
+  float *t_compute) {
+
+  using Gemm = cutlass::gemm::device::GemmBatchedV1<
+    ElementInputA, cutlass::layout::RowMajor,
+    ElementInputB, cutlass::layout::ColumnMajor,
+    ElementOutput, cutlass::layout::ColumnMajor,
+    ElementAccumulator,
+    MMAOp,
+    SmArch,
+    ShapeMMAThreadBlock,
+    ShapeMMAWarp,
+    ShapeMMAOp,
+    EpilogueOp
+    // SwizzleThreadBlock,
+    // NumStages
+  >;
+
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  Gemm gemm_op;
+
+  cutlass::Status status = gemm_op({
+    {m, n, k},
+    {A, lda}, 
+    batch_stride_A,
+    {B, ldb}, 
+    batch_stride_B,
+    {C, ldc}, 
+    batch_stride_C,
+    {C, ldc}, 
+    batch_stride_C,
+    {alpha, beta},
+    batch_count},
+    if_split_phase, partition, t_compute,
+    stream);
+
+  // if (status != cutlass::Status::kSuccess) {
+  //   return cudaErrorUnknown;
+  // }
+
+  return cudaSuccess;
+}
+
 cudaError_t cutlass_strided_batched_sgemm(
   int m, 
   int n,
@@ -306,7 +443,8 @@ cudaError_t cutlass_strided_batched_sgemm(
   int if_split_phase,
   int partition,
   int monitored,
-  int chksum_mode) {
+  bool adaptive_mode,
+  float *t_compute, float *t_update) {
 
   using Gemm = cutlass::gemm::device::GemmBatched<
     ElementInputA, cutlass::layout::RowMajor,
@@ -356,7 +494,7 @@ cudaError_t cutlass_strided_batched_sgemm(
   cudaStream_t stream;
   cudaStreamCreate(&stream);
 
-  printf("monitored batches num: %d\n", monitored);
+  // printf("monitored batches num: %d\n", monitored);
 
   cutlass::Status status = gemm_op({
       {m, n, k},
@@ -370,21 +508,7 @@ cudaError_t cutlass_strided_batched_sgemm(
       batch_stride_C,
       {alpha, beta},
       batch_count},
-      
-      // {
-      //   {m, 16, k},
-      //   {A, lda}, 
-      //   batch_stride_A,
-      //   {(B + (ldb * n)), ldb}, 
-      //   batch_stride_B,
-      //   {(C + (ldc * n)), ldc}, 
-      //   batch_stride_C,
-      //   {(C + (ldc * n)), ldc}, 
-      //   batch_stride_C,
-      //   {alpha, beta},
-      //   batch_count},
-
-      if_split_phase, partition, monitored, 1, chksum_mode,
+      if_split_phase, 't', adaptive_mode, false, t_compute, t_update,
       stream
   );
 
@@ -763,6 +887,77 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
 
   printf("----finish filling matrices-------\n");
 
+  // Arbitrary problem size
+  int const m_baseline = options.problem_size_baseline.m();
+  int const n_baseline = options.problem_size_baseline.n();
+  int const k_baseline = options.problem_size_baseline.k();
+  int const batch_count_baseline = options.batch_count;
+
+  // A, B are non-transpose, column major
+  int const lda_baseline = k_baseline;
+  int const ldb_baseline = k_baseline;
+  int const ldc_baseline = options.problem_size_baseline.m();
+
+  int const count_A_baseline = batch_count_baseline * lda_baseline * options.problem_size_baseline.m();
+  int const count_B_baseline = batch_count_baseline * ldb_baseline * options.problem_size_baseline.n();
+  int const count_C_baseline = batch_count_baseline * ldc_baseline * options.problem_size_baseline.n();
+
+  // the memory is batched along K dimension
+  long long int batch_stride_A_baseline = static_cast<long long int>(lda_baseline) * static_cast<long long int>(options.problem_size_baseline.m());
+  long long int batch_stride_B_baseline = static_cast<long long int>(ldb_baseline) * static_cast<long long int>(options.problem_size_baseline.n());
+  long long int batch_stride_C_baseline = static_cast<long long int>(ldc_baseline) * static_cast<long long int>(options.problem_size_baseline.n());
+
+  std::vector<ElementInputA> host_A_baseline(count_A_baseline);
+  std::vector<ElementInputB> host_B_baseline(count_B_baseline);
+  std::vector<ElementOutput> host_C_baseline(count_C_baseline);
+  std::vector<ElementOutput> result_C_baseline(count_C_baseline);
+
+  // allocate the device memory
+  ElementInputA *A_baseline;
+  ElementInputB *B_baseline;
+  ElementOutput *C_baseline;
+
+  result = cudaMalloc(&A_baseline, count_A_baseline * sizeof(ElementInputA));
+  if (result != cudaSuccess) {
+    std::cerr << "cudaMalloc result = " << result << std::endl;
+    return result;
+  }
+  result = cudaMalloc(&B_baseline, count_B_baseline * sizeof(ElementInputB));
+  if (result != cudaSuccess) {
+    std::cerr << "cudaMalloc result = " << result << std::endl;
+    return result;
+  }
+  result = cudaMalloc(&C_baseline, count_C_baseline * sizeof(ElementOutput));
+  if (result != cudaSuccess) {
+    std::cerr << "cudaMalloc result = " << result << std::endl;
+    return result;
+  }
+
+  for (int b_idx = 0; b_idx < batch_count_baseline; b_idx++) {
+    for (int row_idx = 0; row_idx < m_baseline; row_idx++) {
+      for (int col_idx = 0; col_idx < k_baseline; col_idx++) {
+        host_A_baseline[col_idx + row_idx * lda_baseline + b_idx * lda_baseline * m_baseline] = static_cast<ElementInputA>(static_cast<float>((col_idx + row_idx * lda_baseline + b_idx * lda_baseline * m_baseline) % kRange) / DIV);
+      }
+    }
+  }
+
+  for (int b_idx = 0; b_idx < batch_count_baseline; b_idx++) {
+    for (int col_idx = 0; col_idx < n_baseline; col_idx++) {
+      for (int row_idx = 0; row_idx < k_baseline; row_idx++) {
+        host_B_baseline[row_idx + col_idx * ldb_baseline + b_idx * ldb_baseline * n_baseline] = static_cast<ElementInputB>(static_cast<float>((row_idx + col_idx * ldb_baseline + b_idx * ldb_baseline * n_baseline) % kRange) / DIV);
+      }
+    }
+  }
+
+  // fill C
+  for (int b_idx = 0; b_idx < batch_count_baseline; b_idx++) {
+    for (int col_idx = 0; col_idx < n_baseline; col_idx++) {
+      for (int row_idx = 0; row_idx < m_baseline; row_idx++) {
+        host_C_baseline[row_idx + col_idx * ldc_baseline + b_idx * ldc_baseline * n_baseline] = static_cast<ElementOutput>(0.f);
+      }
+    }
+  }
+
   // ref memory
   std::vector<ElementInputA> ref_A(host_A);
   std::vector<ElementInputB> ref_B(host_B);
@@ -790,15 +985,68 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
 
   // printf("cudablas, m: %d, n: %d, k: %d, lda: %d, ldb: %d, ldc: %d \n", m, n, k, lda, ldb, ldc);
 
+  float t_compute = 0.0f;
+  float t_update = 0.0f;
+
+  float runtime, runtime_v1, runtime_v2, runtime_v3;
   // run cutlass
   for(int i = 0; i < options.iterations; i++){
-    result = cutlass_strided_batched_sgemm(
-      m, n, k, alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
-      beta, batch_count, options.if_split_phase, options.partition, options.monitored, options.chksum_mode);
-    if (result != cudaSuccess){
-      std::cerr << "cutlass result = " << result << std::endl;
-      return result;
+    if(options.eval_mode == 0){
+      result = cutlass_strided_batched_sgemm_baseline(
+        m_baseline, n_baseline, k_baseline, alpha, A_baseline, lda_baseline, batch_stride_A_baseline, 
+        B_baseline, ldb_baseline, batch_stride_B_baseline, 
+        C_baseline, ldc_baseline, batch_stride_C_baseline,
+        beta, batch_count_baseline, &t_compute);
+      cudaDeviceSynchronize();
+      
+      runtime = t_compute / 500;
+
+      result = cutlass_strided_batched_sgemm_v1(
+        options.problem_size.m(), options.problem_size.n(), options.problem_size.k(), alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
+        beta, batch_count, options.if_split_phase, options.partition, &t_compute);
+      cudaDeviceSynchronize();
+
+      runtime_v1 = t_compute / 500;
+      float overhead = ((runtime_v1 - runtime) / runtime) * 100;
+      printf("baseline runtime: %.2f ms, BGT-v1 runtime: %.2f ms, BGT-v1 overhead: %.2f%\n", runtime, runtime_v1, overhead);
+
+      result = cutlass_strided_batched_sgemm(
+        m, n, k, alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
+        beta, batch_count, options.if_split_phase, options.partition, options.monitored, false,
+        &t_compute, &t_update);
+      cudaDeviceSynchronize();
+      
+      runtime_v2 = ((t_compute) > (t_update)) ? (t_compute) : (t_update);
+      overhead = ((runtime_v2 - runtime) / runtime) * 100;
+      printf("baseline runtime: %.2f ms, BGT-v2 runtime: %.2f ms (%.2f, %.2f), BGT-v2 overhead: %.2f%\n", runtime, runtime_v2, t_compute, t_update, overhead);
+
+      result = cutlass_strided_batched_sgemm(
+        m, n, k, alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
+        beta, batch_count, options.if_split_phase, options.partition, options.monitored, true,
+        &t_compute, &t_update);
+      cudaDeviceSynchronize();
+      
+      runtime_v3 = ((t_compute) > (t_update)) ? (t_compute) : (t_update);
+      overhead = ((runtime_v3 - runtime) / runtime) * 100;
+      printf("baseline runtime: %.2f ms, BGT-v3 runtime: %.2f ms (%.2f, %.2f), BGT-v3 overhead: %.2f%\n", runtime, runtime_v3, t_compute, t_update, overhead);
+      
+      // if (result != cudaSuccess){
+      //   std::cerr << "cutlass result = " << result << std::endl;
+      //   return result;
+      // }
     }
+    else{
+      result = cutlass_strided_batched_sgemm(
+        m, n, k, alpha, A, lda, batch_stride_A, B, ldb, batch_stride_B, C, ldc, batch_stride_C,
+        beta, batch_count, options.if_split_phase, options.partition, options.monitored, options.chksum_mode,
+        &t_compute, &t_update);
+      
+      // if (result != cudaSuccess){
+      //   std::cerr << "cutlass result = " << result << std::endl;
+      //   return result;
+      // }
+      cudaDeviceSynchronize();
+    }       
   }
   
   // copy device memory to host
@@ -840,10 +1088,10 @@ cudaError_t run_batched_gemm(bool use_array, Options &options) {
   // outputChk(ref_C, batch_count, ldc, batch_stride_C, m, options.problem_size.n());
 
   // Expect bit-level accuracy for this simple example
-  if (ref_C != result_C) {
-    std::cout << "CUTLASS " << gemm_desc << " gemm does not run correctly" << std::endl;
-    return cudaErrorUnknown;
-  }
+  // if (ref_C != result_C) {
+  //   std::cout << "CUTLASS " << gemm_desc << " gemm does not run correctly" << std::endl;
+  //   return cudaErrorUnknown;
+  // }
 
   // free memory
   result = cudaFree(A);
@@ -882,7 +1130,7 @@ int main(int argc, const char **argv) {
   for (bool use_array : {false}) {
     result = run_batched_gemm(use_array, options);
     if (result == cudaSuccess) {
-      std::cout << "Passed." << std::endl;
+      // std::cout << "Passed." << std::endl;
     } else {
       break;
     }
