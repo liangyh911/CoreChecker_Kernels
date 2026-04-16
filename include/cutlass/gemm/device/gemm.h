@@ -537,7 +537,8 @@ public:
     int num_sms = prop.multiProcessorCount;
 
     // fs::path FIInfoPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "fi_info.bin";
-    fs::path destinationFile = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "FI.txt";
+    // fs::path destinationFile = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "FI.txt";
+    fs::path destinationFile = fs::path("./control/" + std::to_string(gpu_dev)) / "FI.txt";
 
     std::ifstream FIFile(destinationFile);
     if(FIFile.is_open()){
@@ -546,7 +547,8 @@ public:
         injection = true;
         // printf("Perform Fault Injection.\n");
         // Relative Path
-        fs::path planPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "plan.txt";
+        // fs::path planPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "plan.txt";
+        fs::path planPath = fs::path("./control/" + std::to_string(gpu_dev)) / "plan.txt";
         std::ifstream planFile(planPath);
         if(planFile.is_open()){
           std::string line;
@@ -602,7 +604,9 @@ public:
         // Absolute Path
         // fs::path bitPath = fs::path("/home/yuhangl") / ("control_" + std::to_string(gpu_dev)) / "bit.txt";
         // Relative Path
-        fs::path bitPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "bit.txt";
+        // fs::path bitPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "bit.txt";
+        fs::path bitPath = fs::path("./control/" + std::to_string(gpu_dev)) / "bit.txt";
+
         std::ifstream bitFile(bitPath);
         if(bitFile.is_open()){
           if (bitFile >> faulty_bit) {
@@ -702,7 +706,9 @@ public:
       // int gpu_dev = -1;
       // cudaGetDevice(&gpu_dev);
       // char *job_id = getenv("SLURM_JOB_ID");
-      fs::path SMCheckResPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
+      // fs::path SMCheckResPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
+      fs::path SMCheckResPath = fs::path("./control/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
+
       std::ofstream ofs(SMCheckResPath, std::ios::out | std::ios::app);
       // ofs.write(reinterpret_cast<const char*>(h_SM_check_res), sizeof(int) * num_sms);
       for (int i = 0; i < num_sms; i++) {

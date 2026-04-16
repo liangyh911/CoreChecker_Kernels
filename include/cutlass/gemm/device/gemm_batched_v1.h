@@ -466,7 +466,7 @@ public:
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(t_compute, start, stop);
 
-      printf("compute kernel time: %f\n", (*t_compute)/iterations);
+      // printf("compute kernel time: %f\n", (*t_compute)/iterations);
     }
 
     cudaFree(SM_check_res);

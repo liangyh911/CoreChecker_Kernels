@@ -468,7 +468,7 @@ public:
       cudaEventElapsedTime(t_compute, start, stop);
       // destinationFile = fs::path("./control_" + std::string(job_id) + "/" + std::to_string(gpu_dev)) / "time/bgemm.txt";
       // recordTime(destinationFile, t_compute, true);
-      printf("baseline: compute time: %f\n", (*t_compute) / 500);
+      // printf("baseline: compute time: %f\n", (*t_compute) / 500);
     }
 
     result = cudaGetLastError();
