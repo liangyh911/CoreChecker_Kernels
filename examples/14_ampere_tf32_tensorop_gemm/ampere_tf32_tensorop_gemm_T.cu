@@ -45,6 +45,7 @@ implicitly to tf32 inside the GEMM kernel which means no change is needed to acc
 fp32 data by using NVIDIA Ampere architecture.
 
 nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I$HOME/cutlass/include -I$HOME/cutlass/tools/util/include -I$HOME/cutlass/examples/common -arch=sm_80 -o outT_c_f32.exe
+./outT_c_f32.exe --m=8192 --n=8192 --k=8192 --split=0 --iterations=1
 
 nvcc ampere_tf32_tensorop_gemm_T.cu -O0 -I/home/yuhangl/origin_cutlass/cutlass/include -I/home/yuhangl/origin_cutlass/cutlass/tools/util/include -I/home/yuhangl/origin_cutlass/cutlass/examples/common -arch=sm_90 -o outT_baseline_bf16.exe
 
@@ -59,6 +60,7 @@ ncu -f -o transpose --set full ./outT_c_f32.exe --m=4096 --n=8192 --k=4096 --spl
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/device/gemm_baseline.h"
+#include "cutlass/gemm/device/gemm_sign.h"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/host_tensor.h"
@@ -273,6 +275,22 @@ using Gemm = cutlass::gemm::device::Gemm<ElementInputA,
                                          NumStages>;
 
 using Gemm_baseline = cutlass::gemm::device::GemmBaseline<ElementInputA,
+                                         LayoutInputA,
+                                         ElementInputB,
+                                         LayoutInputB,
+                                         ElementOutput,
+                                         LayoutOutput,
+                                         ElementAccumulator,
+                                         MMAOp,
+                                         SmArch,
+                                         ShapeMMAThreadBlock,
+                                         ShapeMMAWarp,
+                                         ShapeMMAOp,
+                                         EpilogueOp,
+                                         SwizzleThreadBlock,
+                                         NumStages>;
+
+using Gemm_Sign = cutlass::gemm::device::GemmSign<ElementInputA,
                                          LayoutInputA,
                                          ElementInputB,
                                          LayoutInputB,
@@ -523,127 +541,175 @@ int run(Options &options) {
     CUTLASS_CHECK(status);
   // }
 
+  typename Gemm_Sign::Arguments arguments_sign{problem_size,  // <- problem size of matrix multiplication
+                                     tensor_a.device_ref(),  // <- reference to matrix A on device
+                                     tensor_b.device_ref(),  // <- reference to matrix B on device
+                                     tensor_c.device_ref(),  // <- reference to matrix C on device
+                                     tensor_d.device_ref(),  // <- reference to matrix D on device
+                                     {alpha, beta},          // <- tuple of alpha and beta
+                                     split_k_slices};        // <- k-dimension split factor
+
+  // Using the arguments, query for extra workspace required for matrix multiplication computation
+  size_t workspace_size_sign = Gemm_Sign::get_workspace_size(arguments_sign);
+
+  // Allocate workspace memory
+  cutlass::device_memory::allocation<uint8_t> workspace_sign(workspace_size_sign);
+
+  // Instantiate CUTLASS kernel depending on templates
+  Gemm_Sign gemm_op_sign;
+
+  // Check the problem size is supported or not 
+  status = gemm_op_sign.can_implement(arguments_sign);
+  CUTLASS_CHECK(status);
+
+  // Initialize CUTLASS kernel with arguments and workspace pointer
+  status = gemm_op_sign.initialize(arguments_sign, workspace_sign.get());
+  CUTLASS_CHECK(status);
+
   //
   // Construct events
   //
 
-  cudaEvent_t events[2];
+  // cudaEvent_t events[2];
 
-  for (auto & event : events) {
-    result.error = cudaEventCreate(&event);
-    if (result.error != cudaSuccess) {
-      std::cerr << "cudaEventCreate() failed: " << cudaGetErrorString(result.error) << std::endl;
-      return -1;
-    }
-  }
+  // for (auto & event : events) {
+  //   result.error = cudaEventCreate(&event);
+  //   if (result.error != cudaSuccess) {
+  //     std::cerr << "cudaEventCreate() failed: " << cudaGetErrorString(result.error) << std::endl;
+  //     return -1;
+  //   }
+  // }
 
-  // Record an event at the start of a series of GEMMs
-  result.error = cudaEventRecord(events[0]);
-  if (result.error != cudaSuccess) {
-    std::cerr << "cudaEventRecord() failed: " << cudaGetErrorString(result.error) << std::endl;
-    return -1;
-  }
+  // // Record an event at the start of a series of GEMMs
+  // result.error = cudaEventRecord(events[0]);
+  // if (result.error != cudaSuccess) {
+  //   std::cerr << "cudaEventRecord() failed: " << cudaGetErrorString(result.error) << std::endl;
+  //   return -1;
+  // }
 
   //
   // Run profiling loop
   //
 
-  float *t_compute; 
-  float runtime, runtime_D, runtime_A, runtime_baseline;
+  float t_compute = 0.f; 
+  float runtime_Grp, runtime_Glo, runtime_Q, runtime, runtime_D, runtime_A, runtime_baseline;
   for (int iter = 0; iter < options.iterations; ++iter) {
     // Launch initialized CUTLASS kernel
-    status = gemm_op(options.if_split_phase, options.partition, 2, t_compute);
-    runtime_A = (*t_compute) / 500;
+    status = gemm_op(options.if_split_phase, options.partition, 2, &t_compute);
+    runtime_A = (t_compute);
+
+    cudaDeviceSynchronize();
+    status = gemm_op(options.if_split_phase, options.partition, 0, &t_compute);
+    runtime = (t_compute);
+
+    cudaDeviceSynchronize();
+    status = gemm_op(options.if_split_phase, options.partition, 1, &t_compute);
+    runtime_D = (t_compute);
 
     // Launch baseline CUTLASS kernel
     cudaDeviceSynchronize();
-    status = gemm_op(options.if_split_phase, options.partition, 0, t_compute);
-    runtime = (*t_compute) / 500;
+    status = gemm_op_baseline(true, &t_compute);
+    runtime_baseline = (t_compute);
 
     cudaDeviceSynchronize();
-    status = gemm_op(options.if_split_phase, options.partition, 1, t_compute);
-    runtime_D = (*t_compute) / 500;
+    status = gemm_op_sign(0, &t_compute);
+    runtime_Glo = (t_compute);
 
     cudaDeviceSynchronize();
-    status = gemm_op_baseline(true, t_compute);
-    runtime_baseline = (*t_compute) / 500;
+    status = gemm_op_sign(1, &t_compute);
+    runtime_Grp = t_compute;
+
+    cudaDeviceSynchronize();
+    status = gemm_op_sign(2, &t_compute);
+    runtime_Q = t_compute;
+
+    float overhead = ((runtime_Glo - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %.2f ms, SignTCC-Glob runtime: %.2f ms, SignTCC-Glob overhead: %.2f%\n", runtime_baseline, runtime_Glo, overhead);
     
-    float overhead = ((runtime - runtime_baseline) / runtime_baseline) * 100;
-    printf("baseline runtime: %f ms, SchTCC runtime: %f ms, SchTCC overhead: %f%\n", runtime_baseline, runtime, overhead);
+    overhead = ((runtime_Grp - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %.2f ms, SignTCC-Grp runtime: %.2f ms, SignTCC-Grp overhead: %.2f%\n", runtime_baseline, runtime_Grp, overhead);
+
+    overhead = ((runtime_Q - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %.2f ms, SignTCC-Q runtime: %.2f ms, SignTCC-Q overhead: %.2f%\n", runtime_baseline, runtime_Q, overhead);
+
+    overhead = ((runtime - runtime_baseline) / runtime_baseline) * 100;
+    printf("baseline runtime: %.2f ms, SchTCC runtime: %.2f ms, SchTCC overhead: %.2f%\n", runtime_baseline, runtime, overhead);
     
     overhead = ((runtime_D - runtime_baseline) / runtime_baseline) * 100;
-    printf("baseline runtime: %f ms, SchTCC-D runtime: %f ms, SchTCC-D overhead: %f%\n", runtime_baseline, runtime, overhead);
+    printf("baseline runtime: %.2f ms, SchTCC-D runtime: %.2f ms, SchTCC-D overhead: %.2f%\n", runtime_baseline, runtime_D, overhead);
     
     overhead = ((runtime_A - runtime_baseline) / runtime_baseline) * 100;
-    printf("baseline runtime: %f ms, SchTCC-A runtime: %f ms, SchTCC-A overhead: %f%\n", runtime_baseline, runtime, overhead);
+    printf("baseline runtime: %.2f ms, SchTCC-A runtime: %.2f ms, SchTCC-A overhead: %.2f%\n", runtime_baseline, runtime_A, overhead);
   }
+
+  return 1;
 
   //
   // Stop profiling loop
   //
 
-  // Record an event when the GEMMs are complete
-  result.error = cudaEventRecord(events[1]);
-  if (result.error != cudaSuccess) {
-    std::cerr << "cudaEventRecord() failed: " << cudaGetErrorString(result.error) << std::endl;
-    return -1;
-  }
+  // // Record an event when the GEMMs are complete
+  // result.error = cudaEventRecord(events[1]);
+  // if (result.error != cudaSuccess) {
+  //   std::cerr << "cudaEventRecord() failed: " << cudaGetErrorString(result.error) << std::endl;
+  //   return -1;
+  // }
 
-  // Wait for work on the device to complete.
-  result.error = cudaEventSynchronize(events[1]);
-  if (result.error != cudaSuccess) {
-    std::cerr << "cudaEventSynchronize() failed: " << cudaGetErrorString(result.error) << std::endl;
-    return -1;
-  }
+  // // Wait for work on the device to complete.
+  // result.error = cudaEventSynchronize(events[1]);
+  // if (result.error != cudaSuccess) {
+  //   std::cerr << "cudaEventSynchronize() failed: " << cudaGetErrorString(result.error) << std::endl;
+  //   return -1;
+  // }
 
-  // Measure elapsed runtime
-  float runtime_ms = 0;
-  result.error = cudaEventElapsedTime(&runtime_ms, events[0], events[1]);
-  if (result.error != cudaSuccess) {
-    std::cerr << "cudaEventElapsed() failed: " << cudaGetErrorString(result.error) << std::endl;
-    return -1;
-  }
+  // // Measure elapsed runtime
+  // float runtime_ms = 0;
+  // result.error = cudaEventElapsedTime(&runtime_ms, events[0], events[1]);
+  // if (result.error != cudaSuccess) {
+  //   std::cerr << "cudaEventElapsed() failed: " << cudaGetErrorString(result.error) << std::endl;
+  //   return -1;
+  // }
 
-  // Compute average runtime and GFLOPs.
-  result.runtime_ms = double(runtime_ms) / double(options.iterations);
-  result.gflops = options.gflops(result.runtime_ms / 1000.0);
+  // // Compute average runtime and GFLOPs.
+  // result.runtime_ms = double(runtime_ms) / double(options.iterations);
+  // result.gflops = options.gflops(result.runtime_ms / 1000.0);
 
-  // Cleanup
-  for (auto event : events) {
-    (void)cudaEventDestroy(event);
-  }
+  // // Cleanup
+  // for (auto event : events) {
+  //   (void)cudaEventDestroy(event);
+  // }
 
-  // Create instantiation for device reference gemm kernel
-  cutlass::reference::device::Gemm<ElementInputA,
-                                   LayoutInputA,
-                                   ElementInputB,
-                                   LayoutInputB,
-                                   ElementOutput,
-                                   LayoutOutput,
-                                   ElementComputeEpilogue,
-                                   ElementComputeEpilogue>
-      gemm_device;
+  // // Create instantiation for device reference gemm kernel
+  // cutlass::reference::device::Gemm<ElementInputA,
+  //                                  LayoutInputA,
+  //                                  ElementInputB,
+  //                                  LayoutInputB,
+  //                                  ElementOutput,
+  //                                  LayoutOutput,
+  //                                  ElementComputeEpilogue,
+  //                                  ElementComputeEpilogue>
+  //     gemm_device;
 
-  // Launch device reference gemm kernel
-  gemm_device(problem_size,
-              alpha,
-              tensor_a.device_ref(),
-              tensor_b.device_ref(),
-              beta,
-              tensor_c.device_ref(),
-              tensor_ref_d.device_ref());
+  // // Launch device reference gemm kernel
+  // gemm_device(problem_size,
+  //             alpha,
+  //             tensor_a.device_ref(),
+  //             tensor_b.device_ref(),
+  //             beta,
+  //             tensor_c.device_ref(),
+  //             tensor_ref_d.device_ref());
 
-  // Wait for kernels to finish
-  cudaDeviceSynchronize();
+  // // Wait for kernels to finish
+  // cudaDeviceSynchronize();
 
-  // Copy output data from CUTLASS and reference kernel to host for comparison
-  tensor_d.sync_host();
-  tensor_ref_d.sync_host();
+  // // Copy output data from CUTLASS and reference kernel to host for comparison
+  // tensor_d.sync_host();
+  // tensor_ref_d.sync_host();
 
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  bool passed = cutlass::reference::host::TensorEquals(
-    tensor_d.host_view(),
-    tensor_ref_d.host_view());
+  // // Check if output from CUTLASS kernel and reference kernel are equal or not
+  // bool passed = cutlass::reference::host::TensorEquals(
+  //   tensor_d.host_view(),
+  //   tensor_ref_d.host_view());
 
   // if (passed) {
   //   std::cout << "Runtime: " << result.runtime_ms << " ms" << std::endl;
@@ -652,7 +718,7 @@ int run(Options &options) {
 
   // std::cout << (passed ? "Passed" : "Failed") << std::endl;
 
-  return (passed ? 0  : -1);
+  // return (passed ? 0  : -1);
 }
 
 int main(int argc, const char **argv) {

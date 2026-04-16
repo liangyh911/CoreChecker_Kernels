@@ -535,6 +535,8 @@ public:
       cudaEventRecord(stop, stream);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(t_compute, start, stop);
+
+      *t_compute = (*t_compute) / 500;
       // destinationFile = fs::path("./control_" + std::string(job_id) + "/" + std::to_string(gpu_dev)) / "time/gemm.txt";
       // recordTime(destinationFile, t_compute, true);
       // printf("baseline compute kernel time: %f\n", (*t_compute)/500);

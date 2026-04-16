@@ -40,7 +40,7 @@
 #include "cutlass/device_kernel.h"
 
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
-#include "cutlass/gemm/kernel/gemm.h"
+#include "cutlass/gemm/kernel/gemm_sign.h"
 
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/device/default_gemm_configuration.h"
@@ -48,12 +48,6 @@
 #include "cutlass/layout/permute.h"
 
 #include "cutlass/gemm_ring_queue.h"
-#include <cmath>
-
-#include <string>
-#include <fstream>
-#include <filesystem>
-namespace fs = std::filesystem;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -175,14 +169,14 @@ namespace device {
     class Gemm;
 */
 
-// __device__ uint8_t *Signature_Array;
-// __device__ int *Lock_Signature;
-// __device__ RingQueue_v2 *d_queues;
-// __device__ int *d_buffer, *d_head, *d_tail;
+__device__ uint8_t *Signature_Array;
+__device__ int *Lock_Signature;
+__device__ RingQueue_v2 *d_queues;
+__device__ int *d_buffer, *d_head, *d_tail;
 
-__device__ int *SM_check_res;
-__device__ int *d_all_start, *d_compute, *d_finding, * d_recompute, *d_compare, *d_checking, *d_SM_JOBS, *d_all_start_for_split;
+__device__ uint8_t *SM_JOBS;
 // __device__ uint8_t *ChkSum_Signature_A_Col;
+__device__ int *Task_Status;
 
 template <
     /// Element type for A matrix operand
@@ -248,7 +242,7 @@ template <
     bool ScatterD = false,
     /// Permute result D
     typename PermuteDLayout = layout::NoPermute>
-class Gemm {
+class GemmSign {
  public:
 
   using ElementA = ElementA_;
@@ -279,7 +273,7 @@ class Gemm {
   static ComplexTransform const kTransformB = ComplexTransform::kNone;
 
   /// Define the kernel
-  using GemmKernel = typename kernel::DefaultGemm<
+  using DefaultGemmKernel = typename kernel::DefaultGemm<
     ElementA,
     LayoutA,
     kAlignmentA,
@@ -305,6 +299,9 @@ class Gemm {
     ScatterD,
     PermuteDLayout
   >::GemmKernel;
+  
+  using GemmKernel = kernel::GemmSign<typename DefaultGemmKernel::Mma, typename DefaultGemmKernel::Epilogue, ThreadblockSwizzle, kSplitKSerial>;
+
 
   /// Argument structure
   struct Arguments {
@@ -372,7 +369,7 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmSign() { }
 
   /// Determines whether the GEMM can execute the given problem.
   static Status can_implement(Arguments const &args) {
@@ -490,9 +487,54 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-              // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-              cudaStream_t stream = nullptr) {
+  Status run(int mode, float *t_compute, cudaStream_t stream = nullptr) {
+
+    // allocate matrix and checksum signature
+
+    // size_t size = 132 * sizeof(uint8_t) * 2;
+    int block_num = params_.grid_tiled_shape.m() * params_.grid_tiled_shape.n();
+    size_t size = block_num * sizeof(uint8_t);
+    cudaMalloc((void**)&Signature_Array, size);
+    cudaMemset(Signature_Array, 255, size);
+
+    // size = 132 * sizeof(int) * 2;
+    size = block_num * sizeof(int);
+    cudaMalloc((void**)&Lock_Signature, size);
+    cudaMemset(Lock_Signature, 0, size);
+
+    int *final_sum;
+    cudaMallocManaged(&final_sum, block_num*sizeof(int));
+    cudaMemset(final_sum, 0, block_num*sizeof(int));
+
+    // 0 - no job, 1 - matrix, 2 - checksum
+    cudaMalloc((void**)&SM_JOBS, 132*sizeof(uint8_t));
+    cudaMemset(SM_JOBS, 0, size);
+
+    // ring queues for each SM
+    int num_queues = 132;
+    int capacity = 20;
+    cudaMalloc((void**)&d_queues, sizeof(RingQueue_v2));
+    cudaMalloc((void**)&d_buffer, sizeof(int) * num_queues * capacity);
+    cudaMemset(d_buffer, 0, sizeof(int) * num_queues * capacity);
+    
+    cudaMalloc((void**)&d_head, sizeof(int) * num_queues);
+    cudaMemset(d_head, 0, sizeof(int) * num_queues);
+    
+    cudaMalloc((void**)&d_tail, sizeof(int) * num_queues);
+    cudaMemset(d_tail, 0, sizeof(int) * num_queues);
+
+    initQueues<<<1,1>>>(d_queues, d_buffer, d_head, d_tail, capacity);
+
+    cudaMalloc((void**)&Task_Status, sizeof(int) * block_num);
+    cudaMemset(Task_Status, 0, sizeof(int) * block_num);
+
+    // cudaMalloc((void**)&d_queues, sizeof(RingQueue)*num_queues);
+
+    // printf("grid_tile_m: %d, grid_tile_n: %d \n", params_.grid_tiled_shape.m(), params_.grid_tiled_shape.n());
+
+    // allocate chksum signature
+    // cudaMalloc((void**)&ChkSum_Signature_A_Col, size);
+    // cudaMemset(ChkSum_Signature_A_Col, 255, size);
 
     ThreadblockSwizzle threadblock_swizzle;
 
@@ -504,7 +546,7 @@ public:
     int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
 
     if (smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(Kernel_GEMM<GemmKernel>,
+      result = cudaFuncSetAttribute(Kernel_Sign<GemmKernel>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     smem_size);
 
@@ -513,222 +555,114 @@ public:
       }
     }
 
-    // Fault Injection Info
-    char flag;
-    bool injection = false;
-    // int faulty_smid = -1, faulty_tid_1 = -1, faulty_tid_2 = -1, faulty_bit = -1;
-
-    int faulty_smid = -1, faulty_bit = -1, *h_faulty_MMAs, *d_faulty_MMAs, *h_faulty_elements, *d_faulty_elements;
-    size_t faulty_size = sizeof(int) * 64;
-
-    h_faulty_MMAs = (int*)malloc(faulty_size);
-    h_faulty_elements = (int*)malloc(faulty_size);
-    cudaMalloc((void**)&d_faulty_MMAs, faulty_size);
-    cudaMemset(d_faulty_MMAs, -1, faulty_size);
-    cudaMalloc((void**)&d_faulty_elements, faulty_size);
-    cudaMemset(d_faulty_elements, -1, faulty_size);
-
-    int gpu_dev = -1;
-    cudaGetDevice(&gpu_dev);
-
-    // get sm count 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, gpu_dev);
-    int num_sms = prop.multiProcessorCount;
-
-    // fs::path FIInfoPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "fi_info.bin";
-    fs::path destinationFile = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "FI.txt";
-
-    std::ifstream FIFile(destinationFile);
-    if(FIFile.is_open()){
-      FIFile.get(flag);
-      if(flag == 't'){
-        injection = true;
-        // printf("Perform Fault Injection.\n");
-        // Relative Path
-        fs::path planPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "plan.txt";
-        std::ifstream planFile(planPath);
-        if(planFile.is_open()){
-          std::string line;
-          // while (std::getline(planFile, line)) {
-            
-          if (!std::getline(planFile, line)) {
-              std::cerr << "File is empty" << std::endl;
-              return Status::kErrorInternal;
-          }
-
-          std::stringstream ss(line);
-          std::string token;
-          std::vector<int> nums;
-
-          while (std::getline(ss, token, ' ')) {
-              nums.push_back(std::stoi(token));
-          }
-
-          if (nums.size() != 129) {
-              printf("Error: expected 129 numbers but got %ld\n", nums.size());
-              return Status::kErrorInternal;
-          }
-
-          int idx = 0;
-          faulty_smid = nums[idx++];
-          faulty_smid = faulty_smid % num_sms;
-          // printf("faulty SM: %d, faulty MMA: ", faulty_smid);
-
-          for (int i = 0; i < 64; i++){
-            h_faulty_MMAs[i] = nums[idx++];
-            // printf("%d ", h_faulty_MMAs[i]);
-          }
-
-          // printf("faulty elements: ");
-          for (int i = 0; i < 64; i++){
-            h_faulty_elements[i] = nums[idx++];
-            // printf("%d ", h_faulty_elements[i]);
-          }
-          // printf("\n");
-              
-          // }
-
-          cudaMemcpy(d_faulty_MMAs, h_faulty_MMAs, faulty_size, cudaMemcpyHostToDevice);
-          cudaMemcpy(d_faulty_elements, h_faulty_elements, faulty_size, cudaMemcpyHostToDevice);
-        }
-        else{
-          printf("plan: Cannot open file, using default setting.\n");
-        }
-        planFile.close();
-
-        // read faulty bit
-        // std::ifstream bitFile("/home/yuhangl/control/bit.txt");
-        // Absolute Path
-        // fs::path bitPath = fs::path("/home/yuhangl") / ("control_" + std::to_string(gpu_dev)) / "bit.txt";
-        // Relative Path
-        fs::path bitPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "bit.txt";
-        std::ifstream bitFile(bitPath);
-        if(bitFile.is_open()){
-          if (bitFile >> faulty_bit) {
-              // std::cout << "faulty_bit = " << faulty_bit << std::endl;
-          }
-        }
-        else{
-          printf("bit: Cannot open file, using default setting.\n");
-        }
-        bitFile.close();
-      }
-      // std::cout << "faulty_smid = " << faulty_smid << ", faulty_tid = " << faulty_tid << " " << "faulty_bit = " << faulty_bit << std::endl;
-    }
-    else{
-      printf("FI: Cannot open file, using default setting.\n");
-    }
-    FIFile.close();
-
     // printf("smem_size: %d\n", smem_size);
 
     // 0-no split; 1-split; 2-only abft
-    // int if_split_phase = 0;
+    int if_split_phase = 0;
 
-    // printf("m: %d, n: %d, k: %d, log: %d\n", params_.problem_size.m(), params_.problem_size.n(), params_.problem_size.k(), params_.swizzle_log_tile);
-    // std::cout << std::is_same<LayoutA_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutB_, cutlass::layout::RowMajor>::value << "; " << std::is_same<LayoutC_, cutlass::layout::RowMajor>::value <<std::endl;
-
-    // // unsigned int nsmid;
-    // cudaDeviceProp prop;
-    // cudaGetDeviceProperties(&prop, 0);
-    // int num_sms = prop.multiProcessorCount;
-
-    // printf("SM count: %d\n", num_sms);
-
-    cudaMalloc((void**)&SM_check_res, num_sms * sizeof(int));
-    cudaMemset(SM_check_res, 0, num_sms * sizeof(int));
-
-    // bool deBug = !injection;
-    int iterations = injection ? 0 : 500;
+    bool deBug = true;
+    int iterations = 2;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    *t_compute = 0;
-    // dim3 new_block(64,1,1);
-    // dim3 new_grid(12,11,1);
-    dim3 new_grid(num_sms, 1, 1);
-
-    // void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion
-    //             // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    //           };
-
-    void *kernelArgs[] = {&params_, &if_split_phase, &SM_check_res, &partion, &SchTCC_mode, &injection,
-                &faulty_smid, &d_faulty_MMAs, &d_faulty_elements, &faulty_bit
-                // &d_all_start, &d_compute, &d_finding, &d_recompute, &d_compare, &d_checking
-    };
-
+    // float t_compute, t_check = 0;
 
     cutlass::arch::synclog_setup();
-
-    // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-    //                                                                 Lock_Signature, final_sum, if_split_phase, 
-    //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-    //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
-
-    cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
-    
     // Grdi: (4, 3, 1); Blocks: (128, 1, 1) when (386, 384, 384)
     // printf("Grdi: (%d, %d, %d); Blocks: (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y, block.z);
+    
+    // Group Launch
+    for (int i = 0; i < 2; i++){
+      cutlass::Kernel_Sign<GemmKernel><<<grid, block, (smem_size), stream>>>(params_, Signature_Array, 
+                                                              Lock_Signature, final_sum, if_split_phase, 
+                                                              d_queues, SM_JOBS, Task_Status, mode);
+    }
+    
+    // Queue Launch                                                        
+    // for (int i = 0; i < 2; i++){
+    //   cutlass::Kernel_Sign<GemmKernel><<<grid, block, (smem_size), stream>>>(params_, Signature_Array, 
+    //                                                         Lock_Signature, final_sum, if_split_phase, 
+    //                                                         d_queues, SM_JOBS, Task_Status);
+    // }
+
     cudaDeviceSynchronize();
-    if(!injection){
+    if(deBug){
       cudaEventRecord(start, stream);
     }
     for(int i = 0; i < iterations; i++){
-      // cutlass::Kernel<GemmKernel><<<new_grid, block, (smem_size), stream>>>(params_, Signature_Array, 
-      //                                                                 Lock_Signature, final_sum, if_split_phase, 
-      //                                                                 d_queues, d_SM_JOBS, SM_schedule, SM_check_res,
-      //                                                                 d_all_start, d_compute, d_finding, d_recompute, d_compare, d_checking);
+      // printf("%d\n", i);    
       
-      cudaLaunchCooperativeKernel((void*)cutlass::Kernel_GEMM<GemmKernel>, new_grid, block, kernelArgs, smem_size, stream);
+      if(mode != 2){
+        cudaMemsetAsync(Signature_Array, 255, block_num * sizeof(uint8_t), stream);
+        cudaMemsetAsync(Lock_Signature, 0, block_num * sizeof(uint8_t), stream);
+        cudaMemsetAsync(final_sum, 0, block_num * sizeof(int), stream);
+        // Lanch for Group Implmentation
+        for (int i = 0; i < 2; i++){
+            cutlass::Kernel_Sign<GemmKernel><<<grid, block, (smem_size), stream>>>(params_, Signature_Array, 
+                                                                Lock_Signature, final_sum, if_split_phase, 
+                                                                d_queues, SM_JOBS, Task_Status, mode);
+        }
+      }
+      else{
+        // Lanch for Queue Implmentation
+        cudaMemsetAsync(d_tail, 0, sizeof(int) * num_queues, stream);
+        cudaMemsetAsync(d_head, 0, sizeof(int) * num_queues, stream);
+        cudaMemsetAsync(d_buffer, 0, sizeof(int) * num_queues * capacity, stream);
+        cudaMemsetAsync(Task_Status, 0, sizeof(int) * block_num, stream);
+        initQueues<<<1,1,0, stream>>>(d_queues, d_buffer, d_head, d_tail, capacity);
+        for (int j = 0; j < 2; j++){
+          cutlass::Kernel_Sign<GemmKernel><<<grid, block, (smem_size), stream>>>(params_, Signature_Array, 
+                                                                          Lock_Signature, final_sum, if_split_phase, 
+                                                                          d_queues, SM_JOBS, Task_Status, mode);
+        }
+      }
     }
-    if(!injection){
+    if(deBug){
       cudaEventRecord(stop, stream);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(t_compute, start, stop);
-      *t_compute = (*t_compute) / iterations;
-      // printf("compute kernel time: %f\n", (*t_compute)/iterations);
     }
     result = cudaGetLastError();
 
-    cudaDeviceSynchronize();
-    
-    // // copy back SM check results
-    if(injection){
-      int *h_SM_check_res;
-      h_SM_check_res = (int*)malloc(num_sms * sizeof(int));
-      cudaMemcpy(h_SM_check_res, SM_check_res, num_sms*sizeof(int), cudaMemcpyDeviceToHost);
-      // record checking results
-      // int gpu_dev = -1;
-      // cudaGetDevice(&gpu_dev);
-      // char *job_id = getenv("SLURM_JOB_ID");
-      fs::path SMCheckResPath = fs::path("/home/yuhangl/control_/" + std::to_string(gpu_dev)) / "SM_checking_results.txt";
-      std::ofstream ofs(SMCheckResPath, std::ios::out | std::ios::app);
-      // ofs.write(reinterpret_cast<const char*>(h_SM_check_res), sizeof(int) * num_sms);
-      for (int i = 0; i < num_sms; i++) {
-          ofs << h_SM_check_res[i];
-          if (i != num_sms - 1)
-              ofs << " ";
-      }
-      ofs << "\n";
-      free(h_SM_check_res);
+    // if(if_split_phase == 1){
+    //   int num_blk_per_group = 2;
+    //   // for(int i = 0; i < 2; i++){
+    //     if(deBug){
+    //       cudaEventRecord(start, stream);
+    //     }
+    //     cutlass::check_between_SM<GemmKernel><<<grid, block, 0, stream>>>(params_, Signature_Array, Lock_Signature, final_sum, num_blk_per_group);
+    //     if(deBug){
+    //       cudaEventRecord(stop, stream);
+    //       cudaEventSynchronize(stop);
+    //       cudaEventElapsedTime(&t_check, start, stop);
+    //       // t_check = t_check + tmp;
+    //       // tmp = 0;
+    //     }
+    //     // cudaMemset(Signature_Array, 255, block_num * sizeof(uint8_t));
+    //     // cudaMemset(Lock_Signature, 0, block_num * sizeof(int));
+    //     // cudaMemset(final_sum, 0, block_num*sizeof(int));
+    //     // cudaDeviceSynchronize();
+    //   // }
+    // }
+
+    cudaFree(d_queues);
+    cudaFree(Signature_Array);
+    cudaFree(Lock_Signature);
+    cudaFree(Task_Status);
+
+    if(deBug){
+        *t_compute = (*t_compute) / iterations;
+        // printf("computer kernel time: %f\n", *t_compute);
     }
-
-    cudaFree(SM_check_res);
-
-    cudaFree(d_faulty_MMAs);
-    cudaFree(d_faulty_elements);
-    free(h_faulty_MMAs);
-    free(h_faulty_elements);
 
     return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, stream);
+  Status operator()(cudaStream_t stream = nullptr) {
+    return run(stream);
   }
- 
+
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
@@ -794,7 +728,7 @@ template <
     /// Permute result D
     typename PermuteDLayout
 >
-class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
+class GemmSign<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
            layout::ColumnMajor,  // partially specialized on LayoutC
            ElementAccumulator_, OperatorClass_, ArchTag_, ThreadblockShape_,
            WarpShape_, InstructionShape_, EpilogueOutputOp_,
@@ -828,7 +762,7 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
   static ComplexTransform const kTransformB = ComplexTransform::kNone;
   static bool const kSplitKSerial = SplitKSerial;
 
-  using UnderlyingOperator = Gemm< 
+  using UnderlyingOperator = GemmSign< 
     ElementB,
     typename layout::LayoutTranspose<LayoutB>::type,
     ElementA,
@@ -919,7 +853,7 @@ private:
 public:
 
   /// Constructs the GEMM.
-  Gemm() { }
+  GemmSign() { }
 
   /// Helper to construct a transposed equivalent for the underying GEMM operator
   static UnderlyingArguments to_underlying_arguments(Arguments const &args) {
@@ -963,22 +897,14 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-            // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking, 
-            cudaStream_t stream = nullptr) {
+  Status run(int mode, float *t_compute, cudaStream_t stream = nullptr) {
 
-    return underlying_operator_.run(if_split_phase, partion, SchTCC_mode, t_compute,
-                                    // all_start, compute, finding, recompute, compare, checking, 
-                                    stream);
+    return underlying_operator_.run(mode, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(int if_split_phase, int partion, int SchTCC_mode, float *t_compute,
-                    // int *all_start, int *compute, int *finding, int *recompute, int *compare, int *checking,
-                    cudaStream_t stream = nullptr) {
-    return run(if_split_phase, partion, SchTCC_mode, t_compute,
-                // all_start, compute, finding, recompute, compare, checking, 
-                stream);
+  Status operator()(int mode, float *t_compute, cudaStream_t stream = nullptr) {
+    return run(mode, t_compute, stream);
   }
 
   /// Runs the kernel using initialized state.

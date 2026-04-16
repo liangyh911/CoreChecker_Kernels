@@ -43,7 +43,7 @@ namespace cutlass{
     // };
 
     struct RingQueue_v2{
-        int *buffer;
+        volatile int *buffer;
         volatile int *head;
         volatile int *tail;
         int capacity;
@@ -81,6 +81,7 @@ namespace cutlass{
             }
             *value = buffer[cur_head + capacity * offset];
             *(head + offset) = (*(head + offset) + 1) % capacity;
+            // printf("%d, %d, %d\n", offset, cur_head, *(head+offset));
             return true;
         }
     };
