@@ -1,6 +1,6 @@
 # CoreChecker Kernels Implementations and Evaluations
 
-CoreChecker is implementated based on NVIDIA CUTLASS library. This repository provides evaluations for CoreChecker kernels.
+CoreChecker is implmented based on NVIDIA CUTLASS library. This repository provides evaluations for CoreChecker kernels.
 
 ### Our Environment
 
@@ -26,7 +26,6 @@ bash ./Evaluation_Scripts/TCC_GEMM.sh
 ### TCC-BGEMM Kernels Evaluations
 
 ```shell
-cd ./CoreChecker_Kernels
 bash ./Evaluation_Scripts/TCC_BGEMM.sh
 ```
 
