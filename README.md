@@ -1,8 +1,10 @@
+This repository is a fork of [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) . The original README can be found [here](#cutlass-390).
+
 # CoreChecker Kernels Implementations and Evaluations
 
 CoreChecker is implmented based on NVIDIA CUTLASS library. This repository provides evaluations for CoreChecker kernels.
 
-### Our Environment
+## Our Environment
 
 - 1 $\times$ NVIDIA H100-SXM5 GPU with 80 GB HBM.
 
@@ -10,11 +12,13 @@ CoreChecker is implmented based on NVIDIA CUTLASS library. This repository provi
 
 - GCC 13.1.0.
 
-### Download Source Code
+## Download Source Code
 
 ```shell
 git clone https://github.com/liangyh911/CoreChecker_Kernels.git
 ```
+
+## Usage
 
 ### TCC-GEMM Kernels Evaluations
 
@@ -28,8 +32,6 @@ bash ./Evaluation_Scripts/TCC_GEMM.sh
 ```shell
 bash ./Evaluation_Scripts/TCC_BGEMM.sh
 ```
-
-## Following are original CUTLASS README.md.
 
 ![ALT](./media/images/gemm-hierarchy-with-epilogue-no-labels.png "Complete CUDA GEMM decomposition")
 
